@@ -914,6 +914,28 @@ func (a *Agent) RunRPC() {
 					}
 				}
 			}(payload)
+
+		case "files_upload_prepare":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				var result map[string]interface{}
+				var err error
+				switch runtime.GOOS {
+				case "windows":
+					result, err = PrepareFilesUploadWindows(a, p)
+				default:
+					result, err = a.PrepareFilesUpload(p)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_upload_prepare:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+				} else {
+					_ = ret.Encode(result)
+				}
+				msg.Respond(resp)
+			}(payload)
 		}
 	})
 	nc.Flush()
