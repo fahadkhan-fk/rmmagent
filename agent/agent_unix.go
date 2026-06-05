@@ -1012,6 +1012,10 @@ func FeedTerminalInputWindows(sessionID string, input string) error {
 	return errors.New("failed to feed input terminal session on windows")
 }
 
+func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, error) {
+	return nil, errors.New("failed to prepare files upload on windows")
+}
+
 func CMD(exe string, args []string, timeout int, detached bool) (output [2]string, e error) {
 	return [2]string{"", ""}, nil
 }
