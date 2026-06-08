@@ -1176,7 +1176,6 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 
 	a.FileTransferSessionsMu.Lock()
-	defer a.FileTransferSessionsMu.Unlock()
 
 	if existing, ok := a.FileTransferSessions[sessionID]; ok {
 		if existing.File != nil {
@@ -1195,6 +1194,9 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		CreatedAt:       time.Now(),
 		File:            file,
 	}
+	a.FileTransferSessionsMu.Unlock()
+
+	startUploadChunkPuller(a, sessionID)
 
 	return map[string]interface{}{
 		"status":           "ready",
