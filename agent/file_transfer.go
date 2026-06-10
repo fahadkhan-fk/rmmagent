@@ -11,11 +11,6 @@ import (
 	"github.com/go-resty/resty/v2"
 )
 
-const (
-	uploadChunkPollInterval  = time.Second
-	uploadSessionPullTimeout = 6 * time.Hour
-)
-
 type UploadTransferSession struct {
 	SessionID       string
 	DestinationPath string
@@ -24,8 +19,6 @@ type UploadTransferSession struct {
 	TotalSize       int64
 	ChunkSize       int64
 	CommittedOffset int64
-	CreatedAt       time.Time
-	PullerStarted   bool
 	File            *os.File
 }
 
@@ -116,72 +109,91 @@ func validateUploadDestinationPath(path string) (string, error) {
 	return cleaned, nil
 }
 
-func startUploadChunkPuller(a *Agent, sessionID string) {
-	a.FileTransferSessionsMu.Lock()
-	session, ok := a.FileTransferSessions[sessionID]
-	if !ok || session == nil || session.PullerStarted {
-		a.FileTransferSessionsMu.Unlock()
-		return
+func (a *Agent) HandleUploadChunkAvailable(p *NatsMsg) (map[string]interface{}, error) {
+	sessionID, err := parsePayloadString(p.Data, "session_id")
+	if err != nil {
+		return nil, err
 	}
-	session.PullerStarted = true
-	a.FileTransferSessionsMu.Unlock()
 
-	go a.PullAndWriteUploadChunks(sessionID)
-}
-
-func (a *Agent) PullAndWriteUploadChunks(sessionID string) {
 	url := fmt.Sprintf("/api/internal/file-transfers/%s/next-chunk/", sessionID)
 
-	for {
-		a.FileTransferSessionsMu.Lock()
-		session, ok := a.FileTransferSessions[sessionID]
-		if !ok || session == nil {
-			a.FileTransferSessionsMu.Unlock()
-			return
-		}
-		if session.CommittedOffset >= session.TotalSize {
-			a.FileTransferSessionsMu.Unlock()
-			return
-		}
-		if time.Since(session.CreatedAt) > uploadSessionPullTimeout {
-			a.FileTransferSessionsMu.Unlock()
-			a.Logger.Errorln("PullAndWriteUploadChunks session timed out:", sessionID)
-			return
-		}
-		a.FileTransferSessionsMu.Unlock()
+	fetchStart := time.Now()
+	resp, err := a.rClient.R().Get(url)
+	if err != nil {
+		return nil, fmt.Errorf("failed to pull upload chunk: %w", err)
+	}
 
-		resp, err := a.rClient.R().Get(url)
+	if resp.StatusCode() == 404 {
+		time.Sleep(100 * time.Millisecond)
+		resp, err = a.rClient.R().Get(url)
 		if err != nil {
-			a.Logger.Errorln("PullAndWriteUploadChunks GET:", err)
-			time.Sleep(uploadChunkPollInterval)
-			continue
+			return nil, fmt.Errorf("failed to pull upload chunk: %w", err)
 		}
-
-		switch resp.StatusCode() {
-		case 404:
-			time.Sleep(uploadChunkPollInterval)
-			continue
-		case 200:
-			if err := a.applyUploadChunk(sessionID, resp); err != nil {
-				a.Logger.Errorln("PullAndWriteUploadChunks write:", err)
-				time.Sleep(uploadChunkPollInterval)
-			}
-		case 401, 403, 410:
-			a.Logger.Errorln(
-				"PullAndWriteUploadChunks auth/session error:",
-				resp.StatusCode(),
-				string(resp.Body()),
+		if resp.StatusCode() == 404 {
+			a.Logger.Debugf(
+				"file_transfer chunk session=%s: no chunk available (handled concurrently)",
+				sessionID,
 			)
-			return
-		default:
-			a.Logger.Errorln(
-				"PullAndWriteUploadChunks status:",
-				resp.StatusCode(),
-				string(resp.Body()),
-			)
-			time.Sleep(uploadChunkPollInterval)
+			return map[string]interface{}{"status": "no_chunk"}, nil
 		}
 	}
+	fetchMs := time.Since(fetchStart).Milliseconds()
+
+	if resp.StatusCode() != 200 {
+		return nil, fmt.Errorf(
+			"pull upload chunk failed: %d %s",
+			resp.StatusCode(),
+			string(resp.Body()),
+		)
+	}
+
+	if err := a.applyUploadChunk(sessionID, resp); err != nil {
+		return nil, err
+	}
+
+	a.FileTransferSessionsMu.Lock()
+	session, ok := a.FileTransferSessions[sessionID]
+	committedOffset := int64(0)
+	totalSize := int64(0)
+	if ok && session != nil {
+		committedOffset = session.CommittedOffset
+		totalSize = session.TotalSize
+	}
+	a.FileTransferSessionsMu.Unlock()
+
+	a.Logger.Infof(
+		"file_transfer chunk session=%s chunk_fetch_ms=%d committed_offset=%d",
+		sessionID,
+		fetchMs,
+		committedOffset,
+	)
+
+	if committedOffset < totalSize {
+		prefetchResp, prefetchErr := a.rClient.R().Get(url)
+		if prefetchErr == nil && prefetchResp.StatusCode() == 200 {
+			if err := a.applyUploadChunk(sessionID, prefetchResp); err != nil {
+				a.Logger.Warnf(
+					"file_transfer prefetch chunk session=%s err=%v",
+					sessionID, err,
+				)
+			} else {
+				a.FileTransferSessionsMu.Lock()
+				if s, ok2 := a.FileTransferSessions[sessionID]; ok2 && s != nil {
+					committedOffset = s.CommittedOffset
+				}
+				a.FileTransferSessionsMu.Unlock()
+				a.Logger.Infof(
+					"file_transfer prefetch chunk session=%s committed_offset=%d",
+					sessionID, committedOffset,
+				)
+			}
+		}
+	}
+
+	return map[string]interface{}{
+		"status":           "acked",
+		"committed_offset": committedOffset,
+	}, nil
 }
 
 func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
@@ -206,17 +218,35 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("upload session file handle is missing")
 	}
-	if start != session.CommittedOffset {
-		a.FileTransferSessionsMu.Unlock()
-		return fmt.Errorf("chunk start offset does not match committed_offset")
-	}
 	if end >= session.TotalSize {
 		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("chunk end exceeds total_size")
 	}
+
+	committedOffset := end + 1
+	if committedOffset <= session.CommittedOffset {
+		a.FileTransferSessionsMu.Unlock()
+		ackStart := time.Now()
+		if err := a.ackUploadChunk(sessionID, committedOffset); err != nil {
+			return err
+		}
+		a.Logger.Infof(
+			"file_transfer chunk session=%s chunk_reack_ms=%d offset=%d",
+			sessionID,
+			time.Since(ackStart).Milliseconds(),
+			committedOffset,
+		)
+		return nil
+	}
+
+	if start != session.CommittedOffset {
+		a.FileTransferSessionsMu.Unlock()
+		return fmt.Errorf("chunk start offset does not match committed_offset")
+	}
 	file := session.File
 	a.FileTransferSessionsMu.Unlock()
 
+	writeStart := time.Now()
 	n, err := file.WriteAt(data, start)
 	if err != nil {
 		return fmt.Errorf("failed to write chunk: %w", err)
@@ -224,27 +254,32 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 	if int64(n) != expectedLen {
 		return fmt.Errorf("short write for upload chunk")
 	}
-
-	committedOffset := end + 1
-	if err := a.ackUploadChunk(sessionID, committedOffset); err != nil {
-		return err
-	}
+	writeMs := time.Since(writeStart).Milliseconds()
 
 	a.FileTransferSessionsMu.Lock()
-	defer a.FileTransferSessionsMu.Unlock()
-
 	session, ok = a.FileTransferSessions[sessionID]
 	if !ok || session == nil {
+		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("upload session not found after write")
 	}
 	if start != session.CommittedOffset {
+		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("chunk start offset changed during write")
 	}
-
 	session.CommittedOffset = committedOffset
-	a.Logger.Debugf(
-		"PullAndWriteUploadChunks wrote session=%s bytes=%d offset=%d",
+	a.FileTransferSessionsMu.Unlock()
+
+	ackStart := time.Now()
+	if err := a.ackUploadChunk(sessionID, committedOffset); err != nil {
+		return err
+	}
+	ackMs := time.Since(ackStart).Milliseconds()
+
+	a.Logger.Infof(
+		"file_transfer chunk session=%s chunk_write_ms=%d chunk_ack_ms=%d bytes=%d offset=%d",
 		sessionID,
+		writeMs,
+		ackMs,
 		expectedLen,
 		committedOffset,
 	)
@@ -343,6 +378,9 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	a.FileTransferSessionsMu.Unlock()
 
 	if file != nil {
+		if err := file.Sync(); err != nil {
+			return nil, fmt.Errorf("failed to sync partial file: %w", err)
+		}
 		if err := file.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close partial file: %w", err)
 		}

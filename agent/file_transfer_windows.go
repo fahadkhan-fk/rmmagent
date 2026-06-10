@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"time"
 )
 
 func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, error) {
@@ -80,12 +79,9 @@ func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, er
 		TotalSize:       totalSize,
 		ChunkSize:       chunkSize,
 		CommittedOffset: 0,
-		CreatedAt:       time.Now(),
 		File:            file,
 	}
 	a.FileTransferSessionsMu.Unlock()
-
-	startUploadChunkPuller(a, sessionID)
 
 	return map[string]interface{}{
 		"status":           "ready",

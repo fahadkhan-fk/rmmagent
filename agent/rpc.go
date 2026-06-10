@@ -937,6 +937,21 @@ func (a *Agent) RunRPC() {
 				msg.Respond(resp)
 			}(payload)
 
+		case "files_upload_chunk_available":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				result, err := a.HandleUploadChunkAvailable(p)
+				if err != nil {
+					a.Logger.Errorln("files_upload_chunk_available:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+				} else {
+					_ = ret.Encode(result)
+				}
+				msg.Respond(resp)
+			}(payload)
+
 		case "files_upload_finalize":
 			go func(p *NatsMsg) {
 				var resp []byte

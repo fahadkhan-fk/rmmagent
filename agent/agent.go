@@ -1191,12 +1191,9 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		TotalSize:       totalSize,
 		ChunkSize:       chunkSize,
 		CommittedOffset: 0,
-		CreatedAt:       time.Now(),
 		File:            file,
 	}
 	a.FileTransferSessionsMu.Unlock()
-
-	startUploadChunkPuller(a, sessionID)
 
 	return map[string]interface{}{
 		"status":           "ready",
