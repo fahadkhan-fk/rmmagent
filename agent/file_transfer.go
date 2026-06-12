@@ -2,7 +2,10 @@ package agent
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +17,9 @@ import (
 )
 
 const downloadPutTimeout = 90 * time.Second
+const fileTransferSessionIdleTimeout = 10 * time.Minute
+const fileTransferReaperInterval = 2 * time.Minute
+const fileTransferPartialRetention = 1 * time.Hour
 
 type UploadTransferSession struct {
 	SessionID       string
@@ -24,6 +30,10 @@ type UploadTransferSession struct {
 	ChunkSize       int64
 	CommittedOffset int64
 	File            *os.File
+	LastActivity    time.Time
+	Hasher          hash.Hash
+	HashedOffset    int64
+	DormantSince    time.Time
 }
 
 func parsePayloadString(data map[string]string, key string) (string, error) {
@@ -52,6 +62,48 @@ func parsePayloadInt64(data map[string]string, key string) (int64, error) {
 		return 0, fmt.Errorf("invalid %s", key)
 	}
 	return n, nil
+}
+
+func parsePayloadResume(data map[string]string) (bool, int64) {
+	resume := strings.EqualFold(strings.TrimSpace(data["resume"]), "true")
+	offset, err := strconv.ParseInt(strings.TrimSpace(data["committed_offset"]), 10, 64)
+	if err != nil || offset < 0 {
+		offset = 0
+	}
+	return resume, offset
+}
+
+func prepareUploadPartialFile(
+	partialPath string, resume bool, resumeOffset, totalSize int64,
+) (*os.File, int64, error) {
+	if !resume {
+		file, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to create partial file: %w", err)
+		}
+		return file, 0, nil
+	}
+
+	if resumeOffset < 0 || resumeOffset > totalSize {
+		return nil, 0, fmt.Errorf("invalid resume offset")
+	}
+	info, err := os.Stat(partialPath)
+	if err != nil {
+		return nil, 0, fmt.Errorf("cannot resume upload, partial file missing: %w", err)
+	}
+	if info.Size() < resumeOffset {
+		return nil, 0, fmt.Errorf("partial file is shorter than resume offset")
+	}
+
+	file, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY, 0o644)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to open partial file: %w", err)
+	}
+	if err := file.Truncate(resumeOffset); err != nil {
+		_ = file.Close()
+		return nil, 0, fmt.Errorf("failed to truncate partial file: %w", err)
+	}
+	return file, resumeOffset, nil
 }
 
 func validateUploadFilename(filename string) error {
@@ -226,6 +278,7 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("upload session file handle is missing")
 	}
+	session.LastActivity = time.Now()
 	if end >= session.TotalSize {
 		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("chunk end exceeds total_size")
@@ -275,6 +328,10 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 		return fmt.Errorf("chunk start offset changed during write")
 	}
 	session.CommittedOffset = committedOffset
+	if session.Hasher != nil && start == session.HashedOffset {
+		session.Hasher.Write(data)
+		session.HashedOffset = committedOffset
+	}
 	a.FileTransferSessionsMu.Unlock()
 
 	ackStart := time.Now()
@@ -383,6 +440,8 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		partialPath = destinationPath + ".partial"
 	}
 	file := session.File
+	hasher := session.Hasher
+	hashedOffset := session.HashedOffset
 	a.FileTransferSessionsMu.Unlock()
 
 	if file != nil {
@@ -408,6 +467,27 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		return nil, fmt.Errorf("partial file size does not match total_size")
 	}
 
+	expectedSHA := strings.ToLower(strings.TrimSpace(p.Data["sha256"]))
+	computedSHA := ""
+	if hasher != nil && hashedOffset == totalSize {
+		computedSHA = hex.EncodeToString(hasher.Sum(nil))
+	} else if expectedSHA != "" {
+		computedSHA, err = hashFileSHA256(partialPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to hash partial file: %w", err)
+		}
+	}
+	if expectedSHA != "" && computedSHA != "" && expectedSHA != computedSHA {
+		_ = os.Remove(partialPath)
+		a.FileTransferSessionsMu.Lock()
+		delete(a.FileTransferSessions, sessionID)
+		a.FileTransferSessionsMu.Unlock()
+		return nil, fmt.Errorf(
+			"integrity check failed: expected sha256 %s but received %s",
+			expectedSHA, computedSHA,
+		)
+	}
+
 	if _, err := os.Stat(destinationPath); err == nil {
 		return nil, fmt.Errorf("destination file already exists")
 	} else if !os.IsNotExist(err) {
@@ -425,16 +505,20 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	return map[string]interface{}{
 		"status":           "completed",
 		"destination_path": destinationPath,
+		"sha256":           computedSHA,
 	}, nil
 }
 
 type DownloadTransferSession struct {
-	SessionID  string
-	SourcePath string
-	TotalSize  int64
-	ChunkSize  int64
-	File       *os.File
-	StopStream chan struct{}
+	SessionID    string
+	SourcePath   string
+	TotalSize    int64
+	ChunkSize    int64
+	File         *os.File
+	StopStream   chan struct{}
+	LastActivity time.Time
+	Hasher       hash.Hash
+	HashedOffset int64
 }
 
 func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error) {
@@ -473,9 +557,23 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		return nil, fmt.Errorf("source file is empty")
 	}
 
+	resume, resumeOffset := parsePayloadResume(p.Data)
+	startOffset := int64(0)
+	if resume {
+		if resumeOffset < 0 || resumeOffset > totalSize {
+			return nil, fmt.Errorf("invalid resume offset")
+		}
+		startOffset = resumeOffset
+	}
+
 	file, err := os.Open(sourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open source file: %w", err)
+	}
+
+	var hasher hash.Hash
+	if startOffset == 0 {
+		hasher = sha256.New()
 	}
 
 	stopStream := make(chan struct{})
@@ -490,16 +588,19 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		}
 	}
 	a.DownloadTransferSessions[sessionID] = &DownloadTransferSession{
-		SessionID:  sessionID,
-		SourcePath: sourcePath,
-		TotalSize:  totalSize,
-		ChunkSize:  chunkSize,
-		File:       file,
-		StopStream: stopStream,
+		SessionID:    sessionID,
+		SourcePath:   sourcePath,
+		TotalSize:    totalSize,
+		ChunkSize:    chunkSize,
+		File:         file,
+		StopStream:   stopStream,
+		LastActivity: time.Now(),
+		Hasher:       hasher,
+		HashedOffset: startOffset,
 	}
 	a.DownloadTransferSessionsMu.Unlock()
 
-	go a.streamDownloadChunks(sessionID, stopStream)
+	go a.streamDownloadChunks(sessionID, stopStream, startOffset)
 
 	return map[string]interface{}{
 		"status":     "ready",
@@ -508,8 +609,8 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 	}, nil
 }
 
-func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}) {
-	offset := int64(0)
+func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, startOffset int64) {
+	offset := startOffset
 	for {
 		select {
 		case <-stop:
@@ -558,6 +659,7 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 		a.DownloadTransferSessionsMu.Unlock()
 		return 0, fmt.Errorf("download session file handle is missing")
 	}
+	session.LastActivity = time.Now()
 	totalSize := session.TotalSize
 	chunkSize := session.ChunkSize
 	file := session.File
@@ -611,6 +713,15 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 		)
 	}
 
+	a.DownloadTransferSessionsMu.Lock()
+	if s, ok := a.DownloadTransferSessions[sessionID]; ok && s != nil {
+		if s.Hasher != nil && offset == s.HashedOffset {
+			s.Hasher.Write(buf[:n])
+			s.HashedOffset = end + 1
+		}
+	}
+	a.DownloadTransferSessionsMu.Unlock()
+
 	offeredOffset := end + 1
 	a.Logger.Infof(
 		"file_transfer download chunk pushed session=%s offset=%d end=%d read_ms=%d put_ms=%d",
@@ -633,8 +744,26 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	}
 	stopStream := session.StopStream
 	file := session.File
+	sourcePath := session.SourcePath
+	totalSize := session.TotalSize
+	hasher := session.Hasher
+	hashedOffset := session.HashedOffset
 	delete(a.DownloadTransferSessions, sessionID)
 	a.DownloadTransferSessionsMu.Unlock()
+
+	computedSHA := ""
+	if hasher != nil && hashedOffset == totalSize {
+		computedSHA = hex.EncodeToString(hasher.Sum(nil))
+	} else if sourcePath != "" {
+		if sha, herr := hashFileSHA256(sourcePath); herr == nil {
+			computedSHA = sha
+		} else {
+			a.Logger.Warnf(
+				"file_transfer download finalize session=%s: failed to hash source: %v",
+				sessionID, herr,
+			)
+		}
+	}
 
 	if stopStream != nil {
 		close(stopStream)
@@ -643,5 +772,106 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		_ = file.Close()
 	}
 
-	return map[string]interface{}{"status": "completed"}, nil
+	return map[string]interface{}{
+		"status": "completed",
+		"sha256": computedSHA,
+	}, nil
+}
+
+func hashFileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func (a *Agent) ReapStaleFileTransferSessions() {
+	now := time.Now()
+
+	type uploadCloseJob struct {
+		sessionID string
+		file      *os.File
+	}
+	var toRelease []uploadCloseJob
+	var toRemove []*UploadTransferSession
+
+	a.FileTransferSessionsMu.Lock()
+	for id, session := range a.FileTransferSessions {
+		if session == nil {
+			delete(a.FileTransferSessions, id)
+			continue
+		}
+		if session.File != nil {
+			if now.Sub(session.LastActivity) > fileTransferSessionIdleTimeout {
+				toRelease = append(toRelease, uploadCloseJob{id, session.File})
+				session.File = nil
+				session.DormantSince = now
+			}
+			continue
+		}
+		if !session.DormantSince.IsZero() &&
+			now.Sub(session.DormantSince) > fileTransferPartialRetention {
+			toRemove = append(toRemove, session)
+			delete(a.FileTransferSessions, id)
+		}
+	}
+	a.FileTransferSessionsMu.Unlock()
+
+	for _, job := range toRelease {
+		_ = job.file.Close()
+		a.Logger.Infof(
+			"file_transfer reaper: upload session=%s idle, handle released; "+
+				".partial kept for resume",
+			job.sessionID,
+		)
+	}
+	for _, session := range toRemove {
+		if session.PartialPath != "" {
+			if err := os.Remove(session.PartialPath); err != nil && !os.IsNotExist(err) {
+				a.Logger.Warnf(
+					"file_transfer reaper: failed to remove partial file %s for session=%s: %v",
+					session.PartialPath, session.SessionID, err,
+				)
+			}
+		}
+		a.Logger.Infof(
+			"file_transfer reaper: removed dormant upload session=%s "+
+				"(.partial retention elapsed)",
+			session.SessionID,
+		)
+	}
+
+	var staleDownloads []*DownloadTransferSession
+	a.DownloadTransferSessionsMu.Lock()
+	for id, session := range a.DownloadTransferSessions {
+		if session == nil {
+			delete(a.DownloadTransferSessions, id)
+			continue
+		}
+		if now.Sub(session.LastActivity) > fileTransferSessionIdleTimeout {
+			staleDownloads = append(staleDownloads, session)
+			delete(a.DownloadTransferSessions, id)
+		}
+	}
+	a.DownloadTransferSessionsMu.Unlock()
+
+	for _, session := range staleDownloads {
+		if session.StopStream != nil {
+			close(session.StopStream)
+		}
+		if session.File != nil {
+			_ = session.File.Close()
+		}
+		a.Logger.Infof(
+			"file_transfer reaper: reaped idle download session=%s idle=%s",
+			session.SessionID, now.Sub(session.LastActivity).Round(time.Second),
+		)
+	}
 }

@@ -14,10 +14,12 @@ package agent
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash"
 	"math"
 	"net"
 	"net/url"
@@ -1172,10 +1174,18 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("parent directory does not exist")
 	}
 
+	resume, resumeOffset := parsePayloadResume(p.Data)
 	partialPath := destinationPath + ".partial"
-	file, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	file, committedOffset, err := prepareUploadPartialFile(
+		partialPath, resume, resumeOffset, totalSize,
+	)
 	if err != nil {
-		return nil, fmt.Errorf("failed to create partial file: %w", err)
+		return nil, err
+	}
+
+	var hasher hash.Hash
+	if !resume {
+		hasher = sha256.New()
 	}
 
 	a.FileTransferSessionsMu.Lock()
@@ -1193,14 +1203,17 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		Filename:        filename,
 		TotalSize:       totalSize,
 		ChunkSize:       chunkSize,
-		CommittedOffset: 0,
+		CommittedOffset: committedOffset,
 		File:            file,
+		LastActivity:    time.Now(),
+		Hasher:          hasher,
+		HashedOffset:    committedOffset,
 	}
 	a.FileTransferSessionsMu.Unlock()
 
 	return map[string]interface{}{
 		"status":           "ready",
-		"committed_offset": int64(0),
+		"committed_offset": committedOffset,
 	}, nil
 }
 

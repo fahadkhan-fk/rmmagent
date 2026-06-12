@@ -116,6 +116,7 @@ func (a *Agent) AgentSvc(nc *nats.Conn) {
 	checkInSWTicker := time.NewTicker(time.Duration(conf.SW) * time.Second)
 	checkInWMITicker := time.NewTicker(time.Duration(conf.WMI) * time.Second)
 	syncMeshTicker := time.NewTicker(time.Duration(conf.SyncMesh) * time.Second)
+	fileTransferReaperTicker := time.NewTicker(fileTransferReaperInterval)
 	extraTicker := a.extraTicker()
 	extraC := tickerChan(extraTicker)
 
@@ -137,6 +138,8 @@ func (a *Agent) AgentSvc(nc *nats.Conn) {
 			a.NatsMessage(nc, "agent-wmi")
 		case <-syncMeshTicker.C:
 			a.SyncMeshNodeID(false)
+		case <-fileTransferReaperTicker.C:
+			a.ReapStaleFileTransferSessions()
 		case <-extraC:
 			a.runExtra()
 		}
