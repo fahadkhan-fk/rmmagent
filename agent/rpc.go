@@ -966,6 +966,36 @@ func (a *Agent) RunRPC() {
 				}
 				msg.Respond(resp)
 			}(payload)
+
+		case "files_download_prepare":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				result, err := a.PrepareFilesDownload(p)
+				if err != nil {
+					a.Logger.Errorln("files_download_prepare:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+				} else {
+					_ = ret.Encode(result)
+				}
+				msg.Respond(resp)
+			}(payload)
+
+		case "files_download_finalize":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				result, err := a.FinalizeFilesDownload(p)
+				if err != nil {
+					a.Logger.Errorln("files_download_finalize:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+				} else {
+					_ = ret.Encode(result)
+				}
+				msg.Respond(resp)
+			}(payload)
 		}
 	})
 	nc.Flush()

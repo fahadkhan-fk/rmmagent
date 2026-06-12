@@ -1,7 +1,9 @@
 package agent
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -10,6 +12,8 @@ import (
 
 	"github.com/go-resty/resty/v2"
 )
+
+const downloadPutTimeout = 90 * time.Second
 
 type UploadTransferSession struct {
 	SessionID       string
@@ -118,14 +122,18 @@ func (a *Agent) HandleUploadChunkAvailable(p *NatsMsg) (map[string]interface{}, 
 	url := fmt.Sprintf("/api/internal/file-transfers/%s/next-chunk/", sessionID)
 
 	fetchStart := time.Now()
-	resp, err := a.rClient.R().Get(url)
+	resp, err := a.rClient.R().
+		SetDebug(false). // binary response body — suppress resty debug logging
+		Get(url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to pull upload chunk: %w", err)
 	}
 
 	if resp.StatusCode() == 404 {
 		time.Sleep(100 * time.Millisecond)
-		resp, err = a.rClient.R().Get(url)
+		resp, err = a.rClient.R().
+			SetDebug(false).
+			Get(url)
 		if err != nil {
 			return nil, fmt.Errorf("failed to pull upload chunk: %w", err)
 		}
@@ -169,7 +177,7 @@ func (a *Agent) HandleUploadChunkAvailable(p *NatsMsg) (map[string]interface{}, 
 	)
 
 	if committedOffset < totalSize {
-		prefetchResp, prefetchErr := a.rClient.R().Get(url)
+		prefetchResp, prefetchErr := a.rClient.R().SetDebug(false).Get(url)
 		if prefetchErr == nil && prefetchResp.StatusCode() == 200 {
 			if err := a.applyUploadChunk(sessionID, prefetchResp); err != nil {
 				a.Logger.Warnf(
@@ -418,4 +426,222 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		"status":           "completed",
 		"destination_path": destinationPath,
 	}, nil
+}
+
+type DownloadTransferSession struct {
+	SessionID  string
+	SourcePath string
+	TotalSize  int64
+	ChunkSize  int64
+	File       *os.File
+	StopStream chan struct{}
+}
+
+func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error) {
+	sessionID, err := parsePayloadString(p.Data, "session_id")
+	if err != nil {
+		return nil, err
+	}
+
+	rawSourcePath, err := parsePayloadString(p.Data, "source_path")
+	if err != nil {
+		return nil, err
+	}
+
+	sourcePath, err := validateUploadDestinationPath(rawSourcePath)
+	if err != nil {
+		return nil, err
+	}
+
+	chunkSize, err := parsePayloadInt64(p.Data, "chunk_size")
+	if err != nil {
+		return nil, err
+	}
+	if chunkSize <= 0 {
+		return nil, fmt.Errorf("chunk_size must be greater than 0")
+	}
+
+	info, err := os.Stat(sourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("source file not found: %w", err)
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("source path is a directory")
+	}
+	totalSize := info.Size()
+	if totalSize == 0 {
+		return nil, fmt.Errorf("source file is empty")
+	}
+
+	file, err := os.Open(sourcePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open source file: %w", err)
+	}
+
+	stopStream := make(chan struct{})
+
+	a.DownloadTransferSessionsMu.Lock()
+	if existing, ok := a.DownloadTransferSessions[sessionID]; ok {
+		if existing.StopStream != nil {
+			close(existing.StopStream)
+		}
+		if existing.File != nil {
+			_ = existing.File.Close()
+		}
+	}
+	a.DownloadTransferSessions[sessionID] = &DownloadTransferSession{
+		SessionID:  sessionID,
+		SourcePath: sourcePath,
+		TotalSize:  totalSize,
+		ChunkSize:  chunkSize,
+		File:       file,
+		StopStream: stopStream,
+	}
+	a.DownloadTransferSessionsMu.Unlock()
+
+	go a.streamDownloadChunks(sessionID, stopStream)
+
+	return map[string]interface{}{
+		"status":     "ready",
+		"total_size": totalSize,
+		"chunk_size": chunkSize,
+	}, nil
+}
+
+func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}) {
+	offset := int64(0)
+	for {
+		select {
+		case <-stop:
+			a.Logger.Debugf("file_transfer download stream session=%s stopped", sessionID)
+			return
+		default:
+		}
+
+		a.DownloadTransferSessionsMu.Lock()
+		session, ok := a.DownloadTransferSessions[sessionID]
+		if !ok || session == nil {
+			a.DownloadTransferSessionsMu.Unlock()
+			return
+		}
+		totalSize := session.TotalSize
+		a.DownloadTransferSessionsMu.Unlock()
+
+		if offset >= totalSize {
+			a.Logger.Infof(
+				"file_transfer download stream session=%s complete offset=%d",
+				sessionID, offset,
+			)
+			return
+		}
+
+		offeredOffset, err := a.pushDownloadChunk(sessionID, offset)
+		if err != nil {
+			a.Logger.Errorf(
+				"file_transfer download stream session=%s offset=%d err=%v",
+				sessionID, offset, err,
+			)
+			return
+		}
+		offset = offeredOffset
+	}
+}
+
+func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error) {
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok := a.DownloadTransferSessions[sessionID]
+	if !ok || session == nil {
+		a.DownloadTransferSessionsMu.Unlock()
+		return 0, fmt.Errorf("download session not found")
+	}
+	if session.File == nil {
+		a.DownloadTransferSessionsMu.Unlock()
+		return 0, fmt.Errorf("download session file handle is missing")
+	}
+	totalSize := session.TotalSize
+	chunkSize := session.ChunkSize
+	file := session.File
+	a.DownloadTransferSessionsMu.Unlock()
+
+	if offset >= totalSize {
+		return offset, nil
+	}
+
+	remaining := totalSize - offset
+	readSize := chunkSize
+	if remaining < readSize {
+		readSize = remaining
+	}
+
+	buf := make([]byte, readSize)
+	readStart := time.Now()
+	n, err := file.ReadAt(buf, offset)
+	if err != nil && err != io.EOF {
+		return 0, fmt.Errorf("failed to read chunk at offset %d: %w", offset, err)
+	}
+	if int64(n) != readSize {
+		return 0, fmt.Errorf("short read at offset %d: got %d want %d", offset, n, readSize)
+	}
+	readMs := time.Since(readStart).Milliseconds()
+
+	end := offset + int64(n) - 1
+	contentRange := fmt.Sprintf("bytes %d-%d/%d", offset, end, totalSize)
+
+	url := fmt.Sprintf("/api/internal/file-transfers/%s/download-chunk/", sessionID)
+	ctx, cancel := context.WithTimeout(context.Background(), downloadPutTimeout)
+	defer cancel()
+
+	putStart := time.Now()
+	resp, err := a.rClient.R().
+		SetDebug(false).
+		SetContext(ctx).
+		SetHeader("Content-Range", contentRange).
+		SetBody(buf[:n]).
+		Put(url)
+	if err != nil {
+		return 0, fmt.Errorf("failed to push download chunk: %w", err)
+	}
+	putMs := time.Since(putStart).Milliseconds()
+
+	if resp.StatusCode() != 200 {
+		return 0, fmt.Errorf(
+			"push download chunk failed: %d %s",
+			resp.StatusCode(),
+			string(resp.Body()),
+		)
+	}
+
+	offeredOffset := end + 1
+	a.Logger.Infof(
+		"file_transfer download chunk pushed session=%s offset=%d end=%d read_ms=%d put_ms=%d",
+		sessionID, offset, end, readMs, putMs,
+	)
+	return offeredOffset, nil
+}
+
+func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error) {
+	sessionID, err := parsePayloadString(p.Data, "session_id")
+	if err != nil {
+		return nil, err
+	}
+
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok := a.DownloadTransferSessions[sessionID]
+	if !ok || session == nil {
+		a.DownloadTransferSessionsMu.Unlock()
+		return map[string]interface{}{"status": "completed"}, nil
+	}
+	stopStream := session.StopStream
+	file := session.File
+	delete(a.DownloadTransferSessions, sessionID)
+	a.DownloadTransferSessionsMu.Unlock()
+
+	if stopStream != nil {
+		close(stopStream)
+	}
+	if file != nil {
+		_ = file.Close()
+	}
+
+	return map[string]interface{}{"status": "completed"}, nil
 }
