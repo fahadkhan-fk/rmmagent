@@ -210,7 +210,7 @@ func (a *Agent) HandleUploadChunkAvailable(p *NatsMsg) (map[string]interface{}, 
 }
 
 func (a *Agent) drainUploadChunks(sessionID string) (int64, error) {
-	url := fmt.Sprintf("/api/internal/file-transfers/%s/next-chunk/", sessionID)
+	url := fmt.Sprintf("/api/v3/file-transfers/%s/next-chunk/", sessionID)
 
 	readState := func() (int64, int64, bool) {
 		a.FileTransferSessionsMu.Lock()
@@ -377,7 +377,7 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 }
 
 func (a *Agent) ackUploadChunk(sessionID string, committedOffset int64) error {
-	url := fmt.Sprintf("/api/internal/file-transfers/%s/ack/", sessionID)
+	url := fmt.Sprintf("/api/v3/file-transfers/%s/ack/", sessionID)
 	payload := map[string]int64{"committed_offset": committedOffset}
 
 	resp, err := a.rClient.R().SetBody(payload).Post(url)
@@ -714,7 +714,7 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 	end := offset + int64(n) - 1
 	contentRange := fmt.Sprintf("bytes %d-%d/%d", offset, end, totalSize)
 
-	url := fmt.Sprintf("/api/internal/file-transfers/%s/download-chunk/", sessionID)
+	url := fmt.Sprintf("/api/v3/file-transfers/%s/download-chunk/", sessionID)
 	ctx, cancel := context.WithTimeout(context.Background(), downloadPutTimeout)
 	defer cancel()
 
