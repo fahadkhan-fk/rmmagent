@@ -915,6 +915,40 @@ func (a *Agent) RunRPC() {
 				}
 			}(payload)
 
+		case "files_list":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				path := strings.TrimSpace(p.Data["path"])
+				if path == "" {
+					a.Logger.Errorln("files_list: missing path")
+					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
+					msg.Respond(resp)
+					return
+				}
+
+				page, pageSize := parseFileBrowserPageParams(p.Data)
+
+				var result map[string]interface{}
+				var err error
+				switch runtime.GOOS {
+				case "windows":
+					result, err = ListDirectoryWindows(path, page, pageSize)
+				default:
+					result, err = a.ListDirectory(path, page, pageSize)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_list:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				_ = ret.Encode(result)
+				msg.Respond(resp)
+			}(payload)
+
 		case "files_upload_prepare":
 			go func(p *NatsMsg) {
 				var resp []byte
