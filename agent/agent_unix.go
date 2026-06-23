@@ -1016,6 +1016,21 @@ func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, er
 	return nil, errors.New("failed to prepare files upload on windows")
 }
 
+func ListDirectoryWindows(rawPath string, page, pageSize int) (map[string]interface{}, error) {
+	return nil, errors.New("directory listing is only supported on Windows")
+}
+
+func fileTimes(info os.FileInfo) (modified, created, accessed string) {
+	mod := formatFileTime(info.ModTime())
+	return mod, mod, mod
+}
+
+func fileAttributeFlags(_ string, info os.FileInfo, name string) (hidden, system, readOnly bool) {
+	readOnly = info.Mode()&0200 == 0
+	hidden = strings.HasPrefix(name, ".")
+	return hidden, false, readOnly
+}
+
 func CMD(exe string, args []string, timeout int, detached bool) (output [2]string, e error) {
 	return [2]string{"", ""}, nil
 }
