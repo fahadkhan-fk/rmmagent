@@ -1020,6 +1020,10 @@ func ListDirectoryWindows(rawPath string, page, pageSize int) (map[string]interf
 	return nil, errors.New("directory listing is only supported on Windows")
 }
 
+func FilePropertiesWindows(rawPath string) (map[string]interface{}, error) {
+	return nil, errors.New("file properties is only supported on Windows")
+}
+
 func fileTimes(info os.FileInfo) (modified, created, accessed string) {
 	mod := formatFileTime(info.ModTime())
 	return mod, mod, mod
