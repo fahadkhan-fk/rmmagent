@@ -224,3 +224,44 @@ func listDirectory(rawPath string, page, pageSize int) (map[string]interface{}, 
 		"total":     total,
 	}, nil
 }
+
+func entryNameFromPath(cleaned string) string {
+	name := filepath.Base(cleaned)
+	if name == "." || name == "" {
+		return cleaned
+	}
+	if name == string(os.PathSeparator) {
+		trimmed := strings.TrimRight(cleaned, string(os.PathSeparator))
+		if trimmed != "" {
+			return filepath.Base(trimmed)
+		}
+		return cleaned
+	}
+	return name
+}
+
+func fileProperties(rawPath string) (map[string]interface{}, error) {
+	cleaned, err := validateUploadDestinationPath(rawPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path")
+	}
+
+	info, err := os.Lstat(cleaned)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("path not found")
+		}
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to access path")
+	}
+
+	name := entryNameFromPath(cleaned)
+	item := buildFileBrowserItem(filepath.Dir(cleaned), name, info)
+	item.Path = cleaned
+	item.ID = cleaned
+	item.Name = name
+
+	return item.toMap(), nil
+}
