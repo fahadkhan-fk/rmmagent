@@ -949,6 +949,38 @@ func (a *Agent) RunRPC() {
 				msg.Respond(resp)
 			}(payload)
 
+		case "files_properties":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				path := strings.TrimSpace(p.Data["path"])
+				if path == "" {
+					a.Logger.Errorln("files_properties: missing path")
+					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
+					msg.Respond(resp)
+					return
+				}
+
+				var result map[string]interface{}
+				var err error
+				switch runtime.GOOS {
+				case "windows":
+					result, err = FilePropertiesWindows(path)
+				default:
+					result, err = a.FileProperties(path)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_properties:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				_ = ret.Encode(result)
+				msg.Respond(resp)
+			}(payload)
+
 		case "files_upload_prepare":
 			go func(p *NatsMsg) {
 				var resp []byte
