@@ -12,6 +12,10 @@ func ListDirectoryWindows(rawPath string, page, pageSize int) (map[string]interf
 	return listDirectory(rawPath, page, pageSize)
 }
 
+func FilePropertiesWindows(rawPath string) (map[string]interface{}, error) {
+	return fileProperties(rawPath)
+}
+
 func fileTimes(info os.FileInfo) (modified, created, accessed string) {
 	modified = formatFileTime(info.ModTime())
 	created = modified
