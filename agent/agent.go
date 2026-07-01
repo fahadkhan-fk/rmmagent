@@ -1217,9 +1217,12 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}, nil
 }
 
-// ListDirectory returns a page of directory entries for Linux and macOS agents.
 func (a *Agent) ListDirectory(rawPath string, page, pageSize int) (map[string]interface{}, error) {
 	return listDirectory(rawPath, page, pageSize)
+}
+
+func (a *Agent) FileProperties(rawPath string) (map[string]interface{}, error) {
+	return fileProperties(rawPath)
 }
 
 func (a *Agent) ReinstallMesh() {
