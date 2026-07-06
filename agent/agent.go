@@ -1225,6 +1225,18 @@ func (a *Agent) FileProperties(rawPath string) (map[string]interface{}, error) {
 	return fileProperties(rawPath)
 }
 
+func (a *Agent) FileMkdir(parentPath, name string) (map[string]interface{}, error) {
+	return fileMkdir(parentPath, name)
+}
+
+func (a *Agent) FileRename(path, newName string) (map[string]interface{}, error) {
+	return fileRename(path, newName)
+}
+
+func (a *Agent) FileDelete(paths []string) (map[string]interface{}, error) {
+	return fileDelete(paths)
+}
+
 func (a *Agent) ReinstallMesh() {
 	if runtime.GOOS != "windows" {
 		return
