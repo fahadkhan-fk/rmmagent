@@ -1024,6 +1024,22 @@ func FilePropertiesWindows(rawPath string) (map[string]interface{}, error) {
 	return nil, errors.New("file properties is only supported on Windows")
 }
 
+func FileMkdirWindows(rawParentPath, rawName string) (map[string]interface{}, error) {
+	return nil, errors.New("file mkdir is only supported on Windows")
+}
+
+func FileRenameWindows(rawPath, rawNewName string) (map[string]interface{}, error) {
+	return nil, errors.New("file rename is only supported on Windows")
+}
+
+func FileDeleteWindows(rawPaths []string) (map[string]interface{}, error) {
+	return nil, errors.New("file delete is only supported on Windows")
+}
+
+func clearPathReadOnlyIfNeeded(_ string) bool {
+	return false
+}
+
 func fileTimes(info os.FileInfo) (modified, created, accessed string) {
 	mod := formatFileTime(info.ModTime())
 	return mod, mod, mod
