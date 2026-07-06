@@ -981,6 +981,115 @@ func (a *Agent) RunRPC() {
 				msg.Respond(resp)
 			}(payload)
 
+		case "files_mkdir":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				path := strings.TrimSpace(p.Data["path"])
+				name := strings.TrimSpace(p.Data["name"])
+				if path == "" {
+					a.Logger.Errorln("files_mkdir: missing path")
+					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
+					msg.Respond(resp)
+					return
+				}
+				if name == "" {
+					a.Logger.Errorln("files_mkdir: missing name")
+					_ = ret.Encode(map[string]interface{}{"error": "missing name"})
+					msg.Respond(resp)
+					return
+				}
+
+				var result map[string]interface{}
+				var err error
+				switch runtime.GOOS {
+				case "windows":
+					result, err = FileMkdirWindows(path, name)
+				default:
+					result, err = a.FileMkdir(path, name)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_mkdir:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				_ = ret.Encode(result)
+				msg.Respond(resp)
+			}(payload)
+
+		case "files_rename":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				path := strings.TrimSpace(p.Data["path"])
+				newName := strings.TrimSpace(p.Data["new_name"])
+				if path == "" {
+					a.Logger.Errorln("files_rename: missing path")
+					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
+					msg.Respond(resp)
+					return
+				}
+				if newName == "" {
+					a.Logger.Errorln("files_rename: missing new_name")
+					_ = ret.Encode(map[string]interface{}{"error": "missing new_name"})
+					msg.Respond(resp)
+					return
+				}
+
+				var result map[string]interface{}
+				var err error
+				switch runtime.GOOS {
+				case "windows":
+					result, err = FileRenameWindows(path, newName)
+				default:
+					result, err = a.FileRename(path, newName)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_rename:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				_ = ret.Encode(result)
+				msg.Respond(resp)
+			}(payload)
+
+		case "files_delete":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				paths, err := parseDeletePaths(p.Data["paths"])
+				if err != nil {
+					a.Logger.Errorln("files_delete:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				var result map[string]interface{}
+				switch runtime.GOOS {
+				case "windows":
+					result, err = FileDeleteWindows(paths)
+				default:
+					result, err = a.FileDelete(paths)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_delete:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				_ = ret.Encode(result)
+				msg.Respond(resp)
+			}(payload)
+
 		case "files_upload_prepare":
 			go func(p *NatsMsg) {
 				var resp []byte
