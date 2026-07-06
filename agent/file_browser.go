@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -264,4 +265,244 @@ func fileProperties(rawPath string) (map[string]interface{}, error) {
 	item.Name = name
 
 	return item.toMap(), nil
+}
+
+func validateFileBrowserName(name string) error {
+	if strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
+		return fmt.Errorf("invalid name")
+	}
+	trimmed := strings.TrimSpace(name)
+	if err := validateUploadFilename(trimmed); err != nil {
+		return err
+	}
+	return nil
+}
+
+func isProtectedDeletePath(cleaned string) bool {
+	vol := filepath.VolumeName(cleaned)
+	if vol != "" {
+		rest := strings.TrimPrefix(cleaned, vol)
+		rest = strings.Trim(strings.TrimPrefix(rest, `\`), `/`)
+		if rest == "" {
+			return true
+		}
+	}
+	if cleaned == string(os.PathSeparator) {
+		return true
+	}
+	return false
+}
+
+func removePathEntry(cleaned string) error {
+	info, err := os.Lstat(cleaned)
+	if err != nil {
+		return err
+	}
+
+	if info.Mode()&os.ModeSymlink != 0 {
+		return os.Remove(cleaned)
+	}
+	if info.IsDir() {
+		return os.RemoveAll(cleaned)
+	}
+	return os.Remove(cleaned)
+}
+
+func removePathEntryWithRetry(cleaned string) error {
+	err := removePathEntry(cleaned)
+	if err == nil {
+		return nil
+	}
+	if clearPathReadOnlyIfNeeded(cleaned) {
+		return removePathEntry(cleaned)
+	}
+	return err
+}
+
+func mapDeleteError(err error) string {
+	if err == nil {
+		return ""
+	}
+	if os.IsNotExist(err) {
+		return "path not found"
+	}
+	if os.IsPermission(err) {
+		return "permission denied"
+	}
+	return "unable to delete path"
+}
+
+func parseDeletePaths(raw string) ([]string, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, fmt.Errorf("missing paths")
+	}
+
+	if strings.HasPrefix(raw, "[") {
+		var paths []string
+		if err := json.Unmarshal([]byte(raw), &paths); err != nil {
+			return nil, fmt.Errorf("invalid paths")
+		}
+		if len(paths) == 0 {
+			return nil, fmt.Errorf("missing paths")
+		}
+		out := make([]string, 0, len(paths))
+		for _, path := range paths {
+			path = strings.TrimSpace(path)
+			if path == "" {
+				return nil, fmt.Errorf("invalid paths")
+			}
+			out = append(out, path)
+		}
+		return out, nil
+	}
+
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			return nil, fmt.Errorf("invalid paths")
+		}
+		out = append(out, part)
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("missing paths")
+	}
+	return out, nil
+}
+
+func fileMkdir(rawParentPath, rawName string) (map[string]interface{}, error) {
+	name := strings.TrimSpace(rawName)
+	if err := validateFileBrowserName(name); err != nil {
+		return nil, fmt.Errorf("invalid name")
+	}
+
+	parentPath, err := validateUploadDestinationPath(rawParentPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path")
+	}
+
+	parentInfo, err := os.Stat(parentPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("path not found")
+		}
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to access path")
+	}
+	if !parentInfo.IsDir() {
+		return nil, fmt.Errorf("path is not a directory")
+	}
+
+	newPath := filepath.Join(parentPath, name)
+	if _, err := os.Lstat(newPath); err == nil {
+		return nil, fmt.Errorf("already exists")
+	} else if !os.IsNotExist(err) {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to access path")
+	}
+
+	if err := os.Mkdir(newPath, 0o755); err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to create folder")
+	}
+
+	return fileProperties(newPath)
+}
+
+func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
+	newName := strings.TrimSpace(rawNewName)
+	if err := validateFileBrowserName(newName); err != nil {
+		return nil, fmt.Errorf("invalid name")
+	}
+
+	cleaned, err := validateUploadDestinationPath(rawPath)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path")
+	}
+
+	oldName := entryNameFromPath(cleaned)
+	if oldName == newName {
+		return nil, fmt.Errorf("new name must differ")
+	}
+
+	if _, err := os.Lstat(cleaned); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("path not found")
+		}
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to access path")
+	}
+
+	newPath := filepath.Join(filepath.Dir(cleaned), newName)
+	if _, err := os.Lstat(newPath); err == nil {
+		return nil, fmt.Errorf("already exists")
+	} else if !os.IsNotExist(err) {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to access path")
+	}
+
+	if err := os.Rename(cleaned, newPath); err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		if os.IsExist(err) {
+			return nil, fmt.Errorf("already exists")
+		}
+		return nil, fmt.Errorf("unable to rename path")
+	}
+
+	return fileProperties(newPath)
+}
+
+func fileDelete(rawPaths []string) (map[string]interface{}, error) {
+	if len(rawPaths) == 0 {
+		return nil, fmt.Errorf("missing paths")
+	}
+
+	results := make([]map[string]interface{}, 0, len(rawPaths))
+	for _, rawPath := range rawPaths {
+		result := map[string]interface{}{
+			"path": strings.TrimSpace(rawPath),
+		}
+
+		cleaned, err := validateUploadDestinationPath(rawPath)
+		if err != nil {
+			result["success"] = false
+			result["error"] = "invalid path"
+			results = append(results, result)
+			continue
+		}
+		result["path"] = cleaned
+
+		if isProtectedDeletePath(cleaned) {
+			result["success"] = false
+			result["error"] = "protected path"
+			results = append(results, result)
+			continue
+		}
+
+		if err := removePathEntryWithRetry(cleaned); err != nil {
+			result["success"] = false
+			result["error"] = mapDeleteError(err)
+			results = append(results, result)
+			continue
+		}
+
+		result["success"] = true
+		results = append(results, result)
+	}
+
+	return map[string]interface{}{"results": results}, nil
 }

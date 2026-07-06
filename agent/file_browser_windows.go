@@ -16,6 +16,36 @@ func FilePropertiesWindows(rawPath string) (map[string]interface{}, error) {
 	return fileProperties(rawPath)
 }
 
+func FileMkdirWindows(rawParentPath, rawName string) (map[string]interface{}, error) {
+	return fileMkdir(rawParentPath, rawName)
+}
+
+func FileRenameWindows(rawPath, rawNewName string) (map[string]interface{}, error) {
+	return fileRename(rawPath, rawNewName)
+}
+
+func FileDeleteWindows(rawPaths []string) (map[string]interface{}, error) {
+	return fileDelete(rawPaths)
+}
+
+func clearPathReadOnlyIfNeeded(path string) bool {
+	pathPtr, err := syscall.UTF16PtrFromString(path)
+	if err != nil {
+		return false
+	}
+
+	attrs, err := syscall.GetFileAttributes(pathPtr)
+	if err != nil {
+		return false
+	}
+	if attrs&syscall.FILE_ATTRIBUTE_READONLY == 0 {
+		return false
+	}
+
+	newAttrs := attrs &^ syscall.FILE_ATTRIBUTE_READONLY
+	return syscall.SetFileAttributes(pathPtr, newAttrs) == nil
+}
+
 func fileTimes(info os.FileInfo) (modified, created, accessed string) {
 	modified = formatFileTime(info.ModTime())
 	created = modified
