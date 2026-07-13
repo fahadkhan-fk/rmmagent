@@ -112,6 +112,21 @@ func prepareUploadPartialFile(
 	return file, resumeOffset, nil
 }
 
+func replaceUploadPartialWithDestination(partialPath, destinationPath string) error {
+	if _, err := os.Stat(destinationPath); err == nil {
+		if err := os.Remove(destinationPath); err != nil {
+			return fmt.Errorf("failed to remove existing destination file: %w", err)
+		}
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to check destination file: %w", err)
+	}
+
+	if err := os.Rename(partialPath, destinationPath); err != nil {
+		return fmt.Errorf("failed to rename partial file: %w", err)
+	}
+	return nil
+}
+
 func validateUploadFilename(filename string) error {
 	if filename == "." || filename == ".." {
 		return fmt.Errorf("invalid filename")
@@ -513,14 +528,8 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		)
 	}
 
-	if _, err := os.Stat(destinationPath); err == nil {
-		return nil, fmt.Errorf("destination file already exists")
-	} else if !os.IsNotExist(err) {
-		return nil, fmt.Errorf("failed to check destination file: %w", err)
-	}
-
-	if err := os.Rename(partialPath, destinationPath); err != nil {
-		return nil, fmt.Errorf("failed to rename partial file: %w", err)
+	if err := replaceUploadPartialWithDestination(partialPath, destinationPath); err != nil {
+		return nil, err
 	}
 
 	a.FileTransferSessionsMu.Lock()
