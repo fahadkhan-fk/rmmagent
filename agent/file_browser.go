@@ -182,6 +182,9 @@ func listDirectory(rawPath string, page, pageSize int) (map[string]interface{}, 
 		if name == "." || name == ".." {
 			continue
 		}
+		if strings.HasSuffix(name, ".partial") {
+			continue
+		}
 
 		fullPath := filepath.Join(cleaned, name)
 		entryInfo, err := entry.Info()
