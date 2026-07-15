@@ -1171,6 +1171,21 @@ func (a *Agent) RunRPC() {
 				}
 				msg.Respond(resp)
 			}(payload)
+
+		case "files_download_archive_prepare":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				result, err := a.PrepareFilesDownloadArchive(p)
+				if err != nil {
+					a.Logger.Errorln("files_download_archive_prepare:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+				} else {
+					_ = ret.Encode(result)
+				}
+				msg.Respond(resp)
+			}(payload)
 		}
 	})
 	nc.Flush()
