@@ -544,15 +544,16 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 }
 
 type DownloadTransferSession struct {
-	SessionID    string
-	SourcePath   string
-	TotalSize    int64
-	ChunkSize    int64
-	File         *os.File
-	StopStream   chan struct{}
-	LastActivity time.Time
-	Hasher       hash.Hash
-	HashedOffset int64
+	SessionID     string
+	SourcePath    string
+	TotalSize     int64
+	ChunkSize     int64
+	File          *os.File
+	StopStream    chan struct{}
+	LastActivity  time.Time
+	Hasher        hash.Hash
+	HashedOffset  int64
+	RemoveOnClose bool
 }
 
 func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error) {
@@ -600,6 +601,8 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		startOffset = resumeOffset
 	}
 
+	removeOnClose := strings.EqualFold(strings.TrimSpace(p.Data["remove_on_close"]), "true")
+
 	file, err := os.Open(sourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open source file: %w", err)
@@ -622,15 +625,16 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		}
 	}
 	a.DownloadTransferSessions[sessionID] = &DownloadTransferSession{
-		SessionID:    sessionID,
-		SourcePath:   sourcePath,
-		TotalSize:    totalSize,
-		ChunkSize:    chunkSize,
-		File:         file,
-		StopStream:   stopStream,
-		LastActivity: time.Now(),
-		Hasher:       hasher,
-		HashedOffset: startOffset,
+		SessionID:     sessionID,
+		SourcePath:    sourcePath,
+		TotalSize:     totalSize,
+		ChunkSize:     chunkSize,
+		File:          file,
+		StopStream:    stopStream,
+		LastActivity:  time.Now(),
+		Hasher:        hasher,
+		HashedOffset:  startOffset,
+		RemoveOnClose: removeOnClose,
 	}
 	a.DownloadTransferSessionsMu.Unlock()
 
@@ -782,6 +786,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	totalSize := session.TotalSize
 	hasher := session.Hasher
 	hashedOffset := session.HashedOffset
+	removeOnClose := session.RemoveOnClose
 	delete(a.DownloadTransferSessions, sessionID)
 	a.DownloadTransferSessionsMu.Unlock()
 
@@ -804,6 +809,14 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	}
 	if file != nil {
 		_ = file.Close()
+	}
+	if removeOnClose && sourcePath != "" {
+		if err := os.Remove(sourcePath); err != nil && !os.IsNotExist(err) {
+			a.Logger.Warnf(
+				"file_transfer download finalize session=%s: failed to remove archive %s: %v",
+				sessionID, sourcePath, err,
+			)
+		}
 	}
 
 	return map[string]interface{}{
@@ -902,6 +915,14 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 		}
 		if session.File != nil {
 			_ = session.File.Close()
+		}
+		if session.RemoveOnClose && session.SourcePath != "" {
+			if err := os.Remove(session.SourcePath); err != nil && !os.IsNotExist(err) {
+				a.Logger.Warnf(
+					"file_transfer reaper: failed to remove archive %s session=%s: %v",
+					session.SourcePath, session.SessionID, err,
+				)
+			}
 		}
 		a.Logger.Infof(
 			"file_transfer reaper: reaped idle download session=%s idle=%s",

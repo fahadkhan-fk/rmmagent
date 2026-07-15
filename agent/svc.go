@@ -120,6 +120,9 @@ func (a *Agent) AgentSvc(nc *nats.Conn) {
 	extraTicker := a.extraTicker()
 	extraC := tickerChan(extraTicker)
 
+	// Reclaim temp archive zip's orphaned by a previous run (crash mid-build/transfer).
+	go a.SweepOrphanedArchives()
+
 	for {
 		select {
 		case <-checkInHelloTicker.C:
