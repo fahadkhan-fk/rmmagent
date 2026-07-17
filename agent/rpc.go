@@ -1142,6 +1142,21 @@ func (a *Agent) RunRPC() {
 				msg.Respond(resp)
 			}(payload)
 
+		case "files_upload_abort":
+			go func(p *NatsMsg) {
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+
+				result, err := a.AbortFilesUpload(p)
+				if err != nil {
+					a.Logger.Errorln("files_upload_abort:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+				} else {
+					_ = ret.Encode(result)
+				}
+				msg.Respond(resp)
+			}(payload)
+
 		case "files_download_prepare":
 			go func(p *NatsMsg) {
 				var resp []byte

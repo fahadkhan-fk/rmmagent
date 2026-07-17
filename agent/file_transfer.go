@@ -543,6 +543,40 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	}, nil
 }
 
+func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
+	sessionID, err := parsePayloadString(p.Data, "session_id")
+	if err != nil {
+		return nil, err
+	}
+
+	a.FileTransferSessionsMu.Lock()
+	session, ok := a.FileTransferSessions[sessionID]
+	if !ok || session == nil {
+		a.FileTransferSessionsMu.Unlock()
+		return map[string]interface{}{"status": "aborted"}, nil
+	}
+	file := session.File
+	partialPath := session.PartialPath
+	session.File = nil
+	delete(a.FileTransferSessions, sessionID)
+	a.FileTransferSessionsMu.Unlock()
+
+	if file != nil {
+		_ = file.Close()
+	}
+	if partialPath != "" {
+		if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
+			a.Logger.Warnf(
+				"file_transfer upload abort session=%s: failed to remove partial %s: %v",
+				sessionID, partialPath, err,
+			)
+		}
+	}
+
+	a.Logger.Infof("file_transfer upload aborted session=%s", sessionID)
+	return map[string]interface{}{"status": "aborted"}, nil
+}
+
 type DownloadTransferSession struct {
 	SessionID     string
 	SourcePath    string

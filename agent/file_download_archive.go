@@ -509,21 +509,38 @@ func (a *Agent) reportArchiveReady(
 	if len(warnings) > 0 {
 		payload["warnings"] = warnings
 	}
-	resp, err := a.rClient.R().SetBody(payload).Post(url)
-	if err != nil {
-		a.Logger.Errorf(
-			"file_transfer archive-ready callback session=%s err=%v", sessionID, err,
-		)
-		return false
+
+	const maxAttempts = 4
+	backoff := 2 * time.Second
+	for attempt := 1; ; attempt++ {
+		resp, err := a.rClient.R().SetBody(payload).Post(url)
+		if err == nil && resp.StatusCode() == 200 {
+			return true
+		}
+		if err == nil && resp.StatusCode() >= 400 && resp.StatusCode() < 500 {
+			a.Logger.Warnf(
+				"file_transfer archive-ready callback session=%s status=%d body=%s (not retrying)",
+				sessionID, resp.StatusCode(), string(resp.Body()),
+			)
+			return false
+		}
+		if attempt >= maxAttempts {
+			if err != nil {
+				a.Logger.Errorf(
+					"file_transfer archive-ready callback session=%s failed after %d attempts err=%v",
+					sessionID, attempt, err,
+				)
+			} else {
+				a.Logger.Warnf(
+					"file_transfer archive-ready callback session=%s failed after %d attempts status=%d",
+					sessionID, attempt, resp.StatusCode(),
+				)
+			}
+			return false
+		}
+		time.Sleep(backoff)
+		backoff *= 2
 	}
-	if resp.StatusCode() != 200 {
-		a.Logger.Warnf(
-			"file_transfer archive-ready callback session=%s status=%d body=%s",
-			sessionID, resp.StatusCode(), string(resp.Body()),
-		)
-		return false
-	}
-	return true
 }
 
 func (a *Agent) reportArchiveError(sessionID, message string) {
