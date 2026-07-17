@@ -601,7 +601,8 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		startOffset = resumeOffset
 	}
 
-	removeOnClose := strings.EqualFold(strings.TrimSpace(p.Data["remove_on_close"]), "true")
+	removeOnClose := strings.EqualFold(strings.TrimSpace(p.Data["remove_on_close"]), "true") &&
+		isArchiveTempPath(sourcePath)
 
 	file, err := os.Open(sourcePath)
 	if err != nil {

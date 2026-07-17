@@ -20,7 +20,7 @@ const (
 	defaultArchiveMaxFiles     = 10_000
 	defaultArchiveMaxSizeBytes = int64(4 * 1024 * 1024 * 1024) // 4 GiB; ZIP64 when exceeded
 	defaultArchiveMaxDepth     = 32
-	archiveDiskSpaceMargin = int64(64 * 1024 * 1024)
+	archiveDiskSpaceMargin     = int64(64 * 1024 * 1024)
 	// Prefix used for all temp archive files so a startup sweep can reclaim orphans.
 	archiveTempPrefix = "trmm-archive-"
 )
@@ -121,6 +121,17 @@ func archiveTempPath(sessionID string) string {
 		}
 	}, sessionID)
 	return filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.zip", archiveTempPrefix, safeID))
+}
+
+func isArchiveTempPath(p string) bool {
+	if p == "" {
+		return false
+	}
+	base := filepath.Base(p)
+	if !strings.HasPrefix(base, archiveTempPrefix) || !strings.HasSuffix(base, ".zip") {
+		return false
+	}
+	return filepath.Clean(filepath.Dir(p)) == filepath.Clean(os.TempDir())
 }
 
 func dedupeZipEntryName(name string, used map[string]struct{}) string {
