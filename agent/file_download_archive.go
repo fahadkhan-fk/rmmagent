@@ -467,6 +467,7 @@ func (a *Agent) buildAndServeArchive(
 
 	if !a.reportArchiveReady(sessionID, tempPath, totalSize, warnings) {
 		_ = os.Remove(tempPath)
+		a.reportArchiveError(sessionID, "failed to report archive ready after retries")
 		return
 	}
 
