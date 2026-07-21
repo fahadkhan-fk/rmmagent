@@ -516,8 +516,15 @@ func fileMkdir(rawParentPath, rawName string) (map[string]interface{}, error) {
 	}
 
 	newPath := filepath.Join(parentPath, name)
-	if _, err := os.Lstat(newPath); err == nil {
-		return nil, fmt.Errorf("already exists")
+	if existing, err := os.Lstat(newPath); err == nil {
+		if existing.IsDir() {
+			return nil, fmt.Errorf(
+				"This destination already contains a folder named %q", name,
+			)
+		}
+		return nil, fmt.Errorf(
+			"This destination already contains a file named %q", name,
+		)
 	} else if !os.IsNotExist(err) {
 		if os.IsPermission(err) {
 			return nil, fmt.Errorf("permission denied")
@@ -526,6 +533,16 @@ func fileMkdir(rawParentPath, rawName string) (map[string]interface{}, error) {
 	}
 
 	if err := os.Mkdir(newPath, 0o755); err != nil {
+		if os.IsExist(err) {
+			if existing, statErr := os.Lstat(newPath); statErr == nil && !existing.IsDir() {
+				return nil, fmt.Errorf(
+					"This destination already contains a file named %q", name,
+				)
+			}
+			return nil, fmt.Errorf(
+				"This destination already contains a folder named %q", name,
+			)
+		}
 		if os.IsPermission(err) {
 			return nil, fmt.Errorf("permission denied")
 		}
@@ -562,8 +579,15 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 	}
 
 	newPath := filepath.Join(filepath.Dir(cleaned), newName)
-	if _, err := os.Lstat(newPath); err == nil {
-		return nil, fmt.Errorf("already exists")
+	if existing, err := os.Lstat(newPath); err == nil {
+		if existing.IsDir() {
+			return nil, fmt.Errorf(
+				"This destination already contains a folder named %q", newName,
+			)
+		}
+		return nil, fmt.Errorf(
+			"This destination already contains a file named %q", newName,
+		)
 	} else if !os.IsNotExist(err) {
 		if os.IsPermission(err) {
 			return nil, fmt.Errorf("permission denied")
@@ -576,7 +600,14 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 			return nil, fmt.Errorf("permission denied")
 		}
 		if os.IsExist(err) {
-			return nil, fmt.Errorf("already exists")
+			if existing, statErr := os.Lstat(newPath); statErr == nil && existing.IsDir() {
+				return nil, fmt.Errorf(
+					"This destination already contains a folder named %q", newName,
+				)
+			}
+			return nil, fmt.Errorf(
+				"This destination already contains a file named %q", newName,
+			)
 		}
 		return nil, fmt.Errorf("unable to rename path")
 	}
