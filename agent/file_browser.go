@@ -12,8 +12,11 @@ import (
 )
 
 const (
-	fileBrowserDefaultPageSize = 500
-	fileBrowserMaxPageSize     = 1000
+	fileBrowserDefaultPageSize      = 500
+	fileBrowserMaxPageSize          = 1000
+	defaultFolderSummaryMaxFiles    = 100_000
+	defaultFolderSummaryMaxDepth    = 32
+	defaultFolderSummaryMaxDuration = 20 * time.Second
 )
 
 type fileBrowserItem struct {
@@ -29,6 +32,106 @@ type fileBrowserItem struct {
 	Hidden    bool
 	System    bool
 	ReadOnly  bool
+}
+
+type folderSummaryLimits struct {
+	maxFiles    int
+	maxDepth    int
+	maxDuration time.Duration
+}
+
+type folderSummary struct {
+	totalBytes  int64
+	fileCount   int
+	folderCount int
+	truncated   bool
+}
+
+func parseFolderSummaryLimits(data map[string]string) folderSummaryLimits {
+	limits := folderSummaryLimits{
+		maxFiles:    defaultFolderSummaryMaxFiles,
+		maxDepth:    defaultFolderSummaryMaxDepth,
+		maxDuration: defaultFolderSummaryMaxDuration,
+	}
+	if data == nil {
+		return limits
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(data["max_files"])); err == nil && v > 0 {
+		limits.maxFiles = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(data["max_depth"])); err == nil && v > 0 {
+		limits.maxDepth = v
+	}
+	if v, err := strconv.Atoi(strings.TrimSpace(data["max_duration_seconds"])); err == nil && v > 0 {
+		limits.maxDuration = time.Duration(v) * time.Second
+	}
+	return limits
+}
+
+func summarizeFolder(root string, limits folderSummaryLimits) folderSummary {
+	summary := folderSummary{}
+	deadline := time.Now().Add(limits.maxDuration)
+	entriesSeen := 0
+
+	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			// Skip unreadable nodes
+			if d != nil && d.IsDir() && path != root {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if path == root {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			summary.truncated = true
+			return filepath.SkipAll
+		}
+
+		rel, relErr := filepath.Rel(root, path)
+		if relErr != nil {
+			return nil
+		}
+		depth := len(strings.Split(filepath.ToSlash(rel), "/"))
+		if depth > limits.maxDepth {
+			summary.truncated = true
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		info, infoErr := d.Info()
+		if infoErr != nil {
+			return nil
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			if d.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		entriesSeen++
+		if entriesSeen > limits.maxFiles {
+			summary.truncated = true
+			return filepath.SkipAll
+		}
+
+		if d.IsDir() {
+			summary.folderCount++
+			return nil
+		}
+
+		summary.fileCount++
+		if size := info.Size(); size > 0 {
+			summary.totalBytes += size
+		}
+		return nil
+	})
+
+	return summary
 }
 
 func parseFileBrowserPageParams(data map[string]string) (int, int) {
@@ -244,7 +347,7 @@ func entryNameFromPath(cleaned string) string {
 	return name
 }
 
-func fileProperties(rawPath string) (map[string]interface{}, error) {
+func fileProperties(rawPath string, limits *folderSummaryLimits) (map[string]interface{}, error) {
 	cleaned, err := validateUploadDestinationPath(rawPath)
 	if err != nil {
 		return nil, fmt.Errorf("invalid path")
@@ -261,13 +364,25 @@ func fileProperties(rawPath string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("unable to access path")
 	}
 
+	parent := filepath.Dir(cleaned)
 	name := entryNameFromPath(cleaned)
-	item := buildFileBrowserItem(filepath.Dir(cleaned), name, info)
+	item := buildFileBrowserItem(parent, name, info)
 	item.Path = cleaned
 	item.ID = cleaned
 	item.Name = name
 
-	return item.toMap(), nil
+	out := item.toMap()
+	out["location"] = parent
+
+	if item.Type == "folder" && limits != nil {
+		summary := summarizeFolder(cleaned, *limits)
+		out["size"] = strconv.FormatInt(summary.totalBytes, 10)
+		out["file_count"] = summary.fileCount
+		out["folder_count"] = summary.folderCount
+		out["summary_truncated"] = summary.truncated
+	}
+
+	return out, nil
 }
 
 func validateFileBrowserName(name string) error {
@@ -417,7 +532,7 @@ func fileMkdir(rawParentPath, rawName string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("unable to create folder")
 	}
 
-	return fileProperties(newPath)
+	return fileProperties(newPath, nil)
 }
 
 func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
@@ -466,7 +581,7 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("unable to rename path")
 	}
 
-	return fileProperties(newPath)
+	return fileProperties(newPath, nil)
 }
 
 func fileDelete(rawPaths []string) (map[string]interface{}, error) {

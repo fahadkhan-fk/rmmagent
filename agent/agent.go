@@ -1221,8 +1221,8 @@ func (a *Agent) ListDirectory(rawPath string, page, pageSize int) (map[string]in
 	return listDirectory(rawPath, page, pageSize)
 }
 
-func (a *Agent) FileProperties(rawPath string) (map[string]interface{}, error) {
-	return fileProperties(rawPath)
+func (a *Agent) FileProperties(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {
+	return fileProperties(rawPath, &limits)
 }
 
 func (a *Agent) FileMkdir(parentPath, name string) (map[string]interface{}, error) {

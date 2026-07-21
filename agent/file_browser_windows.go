@@ -12,8 +12,8 @@ func ListDirectoryWindows(rawPath string, page, pageSize int) (map[string]interf
 	return listDirectory(rawPath, page, pageSize)
 }
 
-func FilePropertiesWindows(rawPath string) (map[string]interface{}, error) {
-	return fileProperties(rawPath)
+func FilePropertiesWindows(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {
+	return fileProperties(rawPath, &limits)
 }
 
 func FileMkdirWindows(rawParentPath, rawName string) (map[string]interface{}, error) {

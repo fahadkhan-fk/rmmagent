@@ -962,13 +962,14 @@ func (a *Agent) RunRPC() {
 					return
 				}
 
+				limits := parseFolderSummaryLimits(p.Data)
 				var result map[string]interface{}
 				var err error
 				switch runtime.GOOS {
 				case "windows":
-					result, err = FilePropertiesWindows(path)
+					result, err = FilePropertiesWindows(path, limits)
 				default:
-					result, err = a.FileProperties(path)
+					result, err = a.FileProperties(path, limits)
 				}
 				if err != nil {
 					a.Logger.Errorln("files_properties:", err)
