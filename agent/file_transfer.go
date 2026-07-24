@@ -34,12 +34,52 @@ type UploadTransferSession struct {
 	TotalSize       int64
 	ChunkSize       int64
 	CommittedOffset int64
+	ConflictPolicy  string
 	File            *os.File
 	LastActivity    time.Time
 	Hasher          hash.Hash
 	HashedOffset    int64
 	DormantSince    time.Time
 	Draining        bool
+}
+
+const (
+	uploadConflictPolicyReplace = "replace"
+	uploadConflictPolicySkip    = "skip"
+	uploadConflictPolicySkipMsg = "destination already exists (conflict_policy=skip)"
+)
+
+func parseUploadConflictPolicy(data map[string]string) string {
+	val := strings.ToLower(strings.TrimSpace(data["conflict_policy"]))
+	if val == uploadConflictPolicySkip {
+		return uploadConflictPolicySkip
+	}
+	return uploadConflictPolicyReplace
+}
+
+func uploadDestinationExists(path string) (bool, error) {
+	_, err := os.Stat(path)
+	if err == nil {
+		return true, nil
+	}
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	return false, err
+}
+
+func enforceUploadConflictPolicySkip(destinationPath, conflictPolicy string) error {
+	if conflictPolicy != uploadConflictPolicySkip {
+		return nil
+	}
+	exists, err := uploadDestinationExists(destinationPath)
+	if err != nil {
+		return fmt.Errorf("failed to check destination file: %w", err)
+	}
+	if exists {
+		return fmt.Errorf("%s", uploadConflictPolicySkipMsg)
+	}
+	return nil
 }
 
 func parsePayloadString(data map[string]string, key string) (string, error) {
@@ -482,6 +522,10 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	file := session.File
 	hasher := session.Hasher
 	hashedOffset := session.HashedOffset
+	conflictPolicy := session.ConflictPolicy
+	if conflictPolicy == "" {
+		conflictPolicy = parseUploadConflictPolicy(p.Data)
+	}
 	a.FileTransferSessionsMu.Unlock()
 
 	if file != nil {
@@ -526,6 +570,14 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 			"integrity check failed: expected sha256 %s but received %s",
 			expectedSHA, computedSHA,
 		)
+	}
+
+	if err := enforceUploadConflictPolicySkip(destinationPath, conflictPolicy); err != nil {
+		_ = os.Remove(partialPath)
+		a.FileTransferSessionsMu.Lock()
+		delete(a.FileTransferSessions, sessionID)
+		a.FileTransferSessionsMu.Unlock()
+		return nil, err
 	}
 
 	if err := replaceUploadPartialWithDestination(partialPath, destinationPath); err != nil {

@@ -60,6 +60,11 @@ func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, er
 		return nil, fmt.Errorf("parent directory does not exist")
 	}
 
+	conflictPolicy := parseUploadConflictPolicy(p.Data)
+	if err := enforceUploadConflictPolicySkip(destinationPath, conflictPolicy); err != nil {
+		return nil, err
+	}
+
 	resume, resumeOffset := parsePayloadResume(p.Data)
 	partialPath := destinationPath + ".partial"
 	file, committedOffset, err := prepareUploadPartialFile(
@@ -90,6 +95,7 @@ func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, er
 		TotalSize:       totalSize,
 		ChunkSize:       chunkSize,
 		CommittedOffset: committedOffset,
+		ConflictPolicy:  conflictPolicy,
 		File:            file,
 		LastActivity:    time.Now(),
 		Hasher:          hasher,
