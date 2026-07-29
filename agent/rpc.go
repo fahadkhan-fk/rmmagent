@@ -919,15 +919,7 @@ func (a *Agent) RunRPC() {
 			go func(p *NatsMsg) {
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
-
 				path := strings.TrimSpace(p.Data["path"])
-				if path == "" {
-					a.Logger.Errorln("files_list: missing path")
-					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
-					msg.Respond(resp)
-					return
-				}
-
 				page, pageSize := parseFileBrowserPageParams(p.Data)
 				nameFilter := parseFileBrowserNameFilter(p.Data)
 

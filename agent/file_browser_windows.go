@@ -4,8 +4,13 @@ package agent
 
 import (
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
+	"unsafe"
+
+	"github.com/shirou/gopsutil/v3/disk"
 )
 
 func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
@@ -26,6 +31,62 @@ func FileRenameWindows(rawPath, rawNewName string) (map[string]interface{}, erro
 
 func FileDeleteWindows(rawPaths []string) (map[string]interface{}, error) {
 	return fileDelete(rawPaths)
+}
+
+func defaultWindowsFileBrowserPathCandidates() []string {
+	var candidates []string
+
+	if public := strings.TrimSpace(os.Getenv("PUBLIC")); public != "" {
+		candidates = append(candidates, public)
+	}
+
+	systemDrive := strings.TrimSpace(os.Getenv("SystemDrive"))
+	if systemDrive == "" {
+		systemDrive = "C:"
+	}
+	driveRoot := systemDrive
+	if len(driveRoot) == 2 && driveRoot[1] == ':' {
+		driveRoot += `\`
+	} else if !strings.HasSuffix(driveRoot, `\`) {
+		driveRoot += `\`
+	}
+
+	candidates = append(candidates,
+		filepath.Join(driveRoot, "Users", "Public"),
+		filepath.Join(driveRoot, "Users"),
+		driveRoot,
+	)
+	candidates = append(candidates, windowsFixedDriveRoots()...)
+	return candidates
+}
+
+func windowsFixedDriveRoots() []string {
+	partitions, err := disk.Partitions(false)
+	if err != nil {
+		return nil
+	}
+
+	roots := make([]string, 0, len(partitions))
+	for _, p := range partitions {
+		typepath, err := syscall.UTF16PtrFromString(p.Device)
+		if err != nil {
+			continue
+		}
+		typeval, _, _ := getDriveType.Call(uintptr(unsafe.Pointer(typepath)))
+		if typeval != 3 {
+			continue
+		}
+
+		root := strings.TrimSpace(p.Mountpoint)
+		if root == "" {
+			continue
+		}
+		if len(root) == 2 && root[1] == ':' {
+			root += `\`
+		}
+		roots = append(roots, root)
+	}
+	return roots
 }
 
 func clearPathReadOnlyIfNeeded(path string) bool {

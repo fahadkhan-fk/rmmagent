@@ -1036,6 +1036,10 @@ func FileDeleteWindows(rawPaths []string) (map[string]interface{}, error) {
 	return nil, errors.New("file delete is only supported on Windows")
 }
 
+func defaultWindowsFileBrowserPathCandidates() []string {
+	return nil
+}
+
 func clearPathReadOnlyIfNeeded(_ string) bool {
 	return false
 }

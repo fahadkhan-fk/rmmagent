@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -410,7 +411,16 @@ func normalizeFileBrowserPage(page, pageSize int) (int, int) {
 }
 
 func listDirectory(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
-	cleaned, err := validateUploadDestinationPath(rawPath)
+	path := strings.TrimSpace(rawPath)
+	if path == "" {
+		resolved, resolveErr := resolveDefaultFileBrowserPath()
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+		path = resolved
+	}
+
+	cleaned, err := validateUploadDestinationPath(path)
 	if err != nil {
 		return nil, fmt.Errorf("invalid path")
 	}
@@ -475,6 +485,69 @@ func listDirectory(rawPath string, page, pageSize int, nameFilter string) (map[s
 		"page_size": pageSize,
 		"total":     total,
 	}, nil
+}
+
+func resolveDefaultFileBrowserPath() (string, error) {
+	candidates := defaultFileBrowserPathCandidates()
+	if path := firstReadableDirectory(candidates); path != "" {
+		return path, nil
+	}
+	return "", fmt.Errorf("no readable default directory found")
+}
+
+func defaultFileBrowserPathCandidates() []string {
+	switch runtime.GOOS {
+	case "windows":
+		return defaultWindowsFileBrowserPathCandidates()
+	case "darwin":
+		return []string{"/Users", "/"}
+	default:
+		// linux and other unix-like agents
+		return []string{"/home", "/"}
+	}
+}
+
+func firstReadableDirectory(candidates []string) string {
+	seen := make(map[string]struct{}, len(candidates))
+	for _, candidate := range candidates {
+		cleaned := normalizeFileBrowserCandidate(candidate)
+		if cleaned == "" {
+			continue
+		}
+		key := cleaned
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(cleaned)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+
+		info, err := os.Stat(cleaned)
+		if err != nil || !info.IsDir() {
+			continue
+		}
+		if _, err := os.ReadDir(cleaned); err != nil {
+			continue
+		}
+		return cleaned
+	}
+	return ""
+}
+
+func normalizeFileBrowserCandidate(candidate string) string {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "" {
+		return ""
+	}
+	if runtime.GOOS == "windows" && len(candidate) == 2 && candidate[1] == ':' {
+		candidate += `\`
+	}
+	cleaned, err := validateUploadDestinationPath(candidate)
+	if err != nil {
+		return ""
+	}
+	return cleaned
 }
 
 func entryNameFromPath(cleaned string) string {
