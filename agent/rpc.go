@@ -929,14 +929,15 @@ func (a *Agent) RunRPC() {
 				}
 
 				page, pageSize := parseFileBrowserPageParams(p.Data)
+				nameFilter := parseFileBrowserNameFilter(p.Data)
 
 				var result map[string]interface{}
 				var err error
 				switch runtime.GOOS {
 				case "windows":
-					result, err = ListDirectoryWindows(path, page, pageSize)
+					result, err = ListDirectoryWindows(path, page, pageSize, nameFilter)
 				default:
-					result, err = a.ListDirectory(path, page, pageSize)
+					result, err = a.ListDirectory(path, page, pageSize, nameFilter)
 				}
 				if err != nil {
 					a.Logger.Errorln("files_list:", err)

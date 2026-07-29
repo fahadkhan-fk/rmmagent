@@ -1223,8 +1223,8 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}, nil
 }
 
-func (a *Agent) ListDirectory(rawPath string, page, pageSize int) (map[string]interface{}, error) {
-	return listDirectory(rawPath, page, pageSize)
+func (a *Agent) ListDirectory(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
+	return listDirectory(rawPath, page, pageSize, nameFilter)
 }
 
 func (a *Agent) FileProperties(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {

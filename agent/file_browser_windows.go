@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-func ListDirectoryWindows(rawPath string, page, pageSize int) (map[string]interface{}, error) {
-	return listDirectory(rawPath, page, pageSize)
+func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
+	return listDirectory(rawPath, page, pageSize, nameFilter)
 }
 
 func FilePropertiesWindows(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {

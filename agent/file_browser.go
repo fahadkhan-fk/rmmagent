@@ -8,12 +8,16 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
 const (
 	fileBrowserDefaultPageSize      = 500
 	fileBrowserMaxPageSize          = 1000
+	fileBrowserFilterSnapshotTTL    = 60 * time.Second
+	fileBrowserFilterSnapshotMax    = 32
+	fileBrowserFilterMaxLen         = 255
 	defaultFolderSummaryMaxFiles    = 100_000
 	defaultFolderSummaryMaxDepth    = 32
 	defaultFolderSummaryMaxDuration = 20 * time.Second
@@ -150,6 +154,162 @@ func parseFileBrowserPageParams(data map[string]string) (int, int) {
 	return page, pageSize
 }
 
+func parseFileBrowserNameFilter(data map[string]string) string {
+	if data == nil {
+		return ""
+	}
+	raw := strings.TrimSpace(data["filter"])
+	if raw == "" {
+		return ""
+	}
+	raw = strings.Map(func(r rune) rune {
+		if r == '\n' || r == '\r' || r == 0 {
+			return -1
+		}
+		return r
+	}, raw)
+	raw = strings.TrimSpace(raw)
+	if len(raw) > fileBrowserFilterMaxLen {
+		raw = raw[:fileBrowserFilterMaxLen]
+	}
+	return raw
+}
+
+type fileBrowserFilterSnapshot struct {
+	path    string
+	filter  string
+	items   []fileBrowserItem
+	expires time.Time
+}
+
+var (
+	fileBrowserFilterSnapshotsMu sync.Mutex
+	fileBrowserFilterSnapshots   = map[string]*fileBrowserFilterSnapshot{}
+)
+
+func fileBrowserFilterSnapshotKey(path, filter string) string {
+	return path + "\x00" + strings.ToLower(filter)
+}
+
+func getFileBrowserFilterSnapshot(path, filter string) ([]fileBrowserItem, bool) {
+	key := fileBrowserFilterSnapshotKey(path, filter)
+	now := time.Now()
+
+	fileBrowserFilterSnapshotsMu.Lock()
+	defer fileBrowserFilterSnapshotsMu.Unlock()
+
+	snap, ok := fileBrowserFilterSnapshots[key]
+	if !ok {
+		return nil, false
+	}
+	if now.After(snap.expires) {
+		delete(fileBrowserFilterSnapshots, key)
+		return nil, false
+	}
+	return snap.items, true
+}
+
+func storeFileBrowserFilterSnapshot(path, filter string, items []fileBrowserItem) {
+	key := fileBrowserFilterSnapshotKey(path, filter)
+	now := time.Now()
+
+	fileBrowserFilterSnapshotsMu.Lock()
+	defer fileBrowserFilterSnapshotsMu.Unlock()
+
+	if len(fileBrowserFilterSnapshots) >= fileBrowserFilterSnapshotMax {
+		var oldestKey string
+		var oldestExp time.Time
+		for k, snap := range fileBrowserFilterSnapshots {
+			if now.After(snap.expires) {
+				delete(fileBrowserFilterSnapshots, k)
+				continue
+			}
+			if oldestKey == "" || snap.expires.Before(oldestExp) {
+				oldestKey = k
+				oldestExp = snap.expires
+			}
+		}
+		if len(fileBrowserFilterSnapshots) >= fileBrowserFilterSnapshotMax && oldestKey != "" {
+			delete(fileBrowserFilterSnapshots, oldestKey)
+		}
+	}
+
+	copied := make([]fileBrowserItem, len(items))
+	copy(copied, items)
+	fileBrowserFilterSnapshots[key] = &fileBrowserFilterSnapshot{
+		path:    path,
+		filter:  filter,
+		items:   copied,
+		expires: now.Add(fileBrowserFilterSnapshotTTL),
+	}
+}
+
+func clearFileBrowserFilterSnapshotsForTest() {
+	fileBrowserFilterSnapshotsMu.Lock()
+	defer fileBrowserFilterSnapshotsMu.Unlock()
+	fileBrowserFilterSnapshots = map[string]*fileBrowserFilterSnapshot{}
+}
+
+func nameMatchesFileBrowserFilter(name, filter string) bool {
+	if filter == "" {
+		return true
+	}
+	return strings.Contains(strings.ToLower(name), strings.ToLower(filter))
+}
+
+func paginateFileBrowserItems(items []fileBrowserItem, page, pageSize int) (encoded []map[string]interface{}, total int, hasMore bool) {
+	total = len(items)
+	start := (page - 1) * pageSize
+	if start > total {
+		start = total
+	}
+	end := start + pageSize
+	if end > total {
+		end = total
+	}
+	hasMore = end < total
+
+	pageItems := items[start:end]
+	encoded = make([]map[string]interface{}, 0, len(pageItems))
+	for _, item := range pageItems {
+		encoded = append(encoded, item.toMap())
+	}
+	return encoded, total, hasMore
+}
+
+func buildDirectoryItems(cleaned string) ([]fileBrowserItem, error) {
+	entries, err := os.ReadDir(cleaned)
+	if err != nil {
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to read directory")
+	}
+
+	items := make([]fileBrowserItem, 0, len(entries))
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == "." || name == ".." {
+			continue
+		}
+		if strings.HasSuffix(name, ".partial") {
+			continue
+		}
+
+		fullPath := filepath.Join(cleaned, name)
+		entryInfo, err := entry.Info()
+		if err != nil {
+			entryInfo, err = os.Lstat(fullPath)
+			if err != nil {
+				continue
+			}
+		}
+
+		items = append(items, buildFileBrowserItem(cleaned, name, entryInfo))
+	}
+	return items, nil
+}
+
 func extensionFromName(name string) string {
 	ext := filepath.Ext(name)
 	if ext == "" || ext == "." || ext == ".." {
@@ -249,7 +409,7 @@ func normalizeFileBrowserPage(page, pageSize int) (int, int) {
 	return page, pageSize
 }
 
-func listDirectory(rawPath string, page, pageSize int) (map[string]interface{}, error) {
+func listDirectory(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
 	cleaned, err := validateUploadDestinationPath(rawPath)
 	if err != nil {
 		return nil, fmt.Errorf("invalid path")
@@ -270,57 +430,42 @@ func listDirectory(rawPath string, page, pageSize int) (map[string]interface{}, 
 	}
 
 	page, pageSize = normalizeFileBrowserPage(page, pageSize)
+	nameFilter = strings.TrimSpace(nameFilter)
 
-	entries, err := os.ReadDir(cleaned)
-	if err != nil {
-		if os.IsPermission(err) {
-			return nil, fmt.Errorf("permission denied")
-		}
-		return nil, fmt.Errorf("unable to read directory")
-	}
+	var items []fileBrowserItem
 
-	items := make([]fileBrowserItem, 0, len(entries))
-	for _, entry := range entries {
-		name := entry.Name()
-		if name == "." || name == ".." {
-			continue
-		}
-		if strings.HasSuffix(name, ".partial") {
-			continue
-		}
-
-		fullPath := filepath.Join(cleaned, name)
-		entryInfo, err := entry.Info()
-		if err != nil {
-			entryInfo, err = os.Lstat(fullPath)
-			if err != nil {
-				continue
+	if nameFilter != "" {
+		if cached, ok := getFileBrowserFilterSnapshot(cleaned, nameFilter); ok {
+			items = cached
+		} else {
+			built, buildErr := buildDirectoryItems(cleaned)
+			if buildErr != nil {
+				return nil, buildErr
 			}
+			filtered := make([]fileBrowserItem, 0, len(built))
+			for _, item := range built {
+				if nameMatchesFileBrowserFilter(item.Name, nameFilter) {
+					filtered = append(filtered, item)
+				}
+			}
+			sort.Slice(filtered, func(i, j int) bool {
+				return compareFileBrowserItems(filtered[i], filtered[j]) < 0
+			})
+			storeFileBrowserFilterSnapshot(cleaned, nameFilter, filtered)
+			items = filtered
 		}
-
-		items = append(items, buildFileBrowserItem(cleaned, name, entryInfo))
+	} else {
+		built, buildErr := buildDirectoryItems(cleaned)
+		if buildErr != nil {
+			return nil, buildErr
+		}
+		sort.Slice(built, func(i, j int) bool {
+			return compareFileBrowserItems(built[i], built[j]) < 0
+		})
+		items = built
 	}
 
-	sort.Slice(items, func(i, j int) bool {
-		return compareFileBrowserItems(items[i], items[j]) < 0
-	})
-
-	total := len(items)
-	start := (page - 1) * pageSize
-	if start > total {
-		start = total
-	}
-	end := start + pageSize
-	if end > total {
-		end = total
-	}
-	hasMore := end < total
-
-	pageItems := items[start:end]
-	encoded := make([]map[string]interface{}, 0, len(pageItems))
-	for _, item := range pageItems {
-		encoded = append(encoded, item.toMap())
-	}
+	encoded, total, hasMore := paginateFileBrowserItems(items, page, pageSize)
 
 	return map[string]interface{}{
 		"path":      cleaned,

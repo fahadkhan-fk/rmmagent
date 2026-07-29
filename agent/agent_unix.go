@@ -1016,7 +1016,7 @@ func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, er
 	return nil, errors.New("failed to prepare files upload on windows")
 }
 
-func ListDirectoryWindows(rawPath string, page, pageSize int) (map[string]interface{}, error) {
+func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
 	return nil, errors.New("directory listing is only supported on Windows")
 }
 
