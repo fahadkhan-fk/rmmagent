@@ -465,14 +465,22 @@ func listDirectory(rawPath string, page, pageSize int, nameFilter string) (map[s
 			items = filtered
 		}
 	} else {
-		built, buildErr := buildDirectoryItems(cleaned)
-		if buildErr != nil {
-			return nil, buildErr
+		if page > 1 {
+			if cached, ok := getFileBrowserFilterSnapshot(cleaned, ""); ok {
+				items = cached
+			}
 		}
-		sort.Slice(built, func(i, j int) bool {
-			return compareFileBrowserItems(built[i], built[j]) < 0
-		})
-		items = built
+		if items == nil {
+			built, buildErr := buildDirectoryItems(cleaned)
+			if buildErr != nil {
+				return nil, buildErr
+			}
+			sort.Slice(built, func(i, j int) bool {
+				return compareFileBrowserItems(built[i], built[j]) < 0
+			})
+			storeFileBrowserFilterSnapshot(cleaned, "", built)
+			items = built
+		}
 	}
 
 	encoded, total, hasMore := paginateFileBrowserItems(items, page, pageSize)
