@@ -1012,10 +1012,6 @@ func FeedTerminalInputWindows(sessionID string, input string) error {
 	return errors.New("failed to feed input terminal session on windows")
 }
 
-func PrepareFilesUploadWindows(a *Agent, p *NatsMsg) (map[string]interface{}, error) {
-	return nil, errors.New("failed to prepare files upload on windows")
-}
-
 func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
 	return nil, errors.New("directory listing is only supported on Windows")
 }

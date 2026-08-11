@@ -1089,14 +1089,7 @@ func (a *Agent) RunRPC() {
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
-				var result map[string]interface{}
-				var err error
-				switch runtime.GOOS {
-				case "windows":
-					result, err = PrepareFilesUploadWindows(a, p)
-				default:
-					result, err = a.PrepareFilesUpload(p)
-				}
+				result, err := a.PrepareFilesUpload(p)
 				if err != nil {
 					a.Logger.Errorln("files_upload_prepare:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
