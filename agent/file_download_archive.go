@@ -164,6 +164,7 @@ func collectArchiveEntries(
 ) (files []archiveFileEntry, dirNames []string, warnings []string, totalBytes int64, err error) {
 	usedNames := make(map[string]struct{})
 	fileCount := 0
+	depthTruncated := false
 
 	for _, root := range roots {
 		info, statErr := os.Lstat(root)
@@ -199,7 +200,20 @@ func collectArchiveEntries(
 
 				depth := len(strings.Split(filepath.ToSlash(rel), "/"))
 				if depth > limits.maxDepth {
-					return filepath.SkipDir
+					if !depthTruncated {
+						depthTruncated = true
+						warnings = append(
+							warnings,
+							fmt.Sprintf(
+								"Some items were omitted because they exceed the maximum archive depth (%d).",
+								limits.maxDepth,
+							),
+						)
+					}
+					if d.IsDir() {
+						return filepath.SkipDir
+					}
+					return nil
 				}
 
 				entryInfo, entryErr := d.Info()
