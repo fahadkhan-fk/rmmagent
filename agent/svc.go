@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	nats "github.com/nats-io/nats.go"
@@ -122,6 +123,7 @@ func (a *Agent) AgentSvc(nc *nats.Conn) {
 
 	// Reclaim temp archive zip's orphaned by a previous run (crash mid-build/transfer).
 	go a.SweepOrphanedArchives()
+	var syncMeshRunning atomic.Bool
 
 	for {
 		select {
@@ -140,7 +142,14 @@ func (a *Agent) AgentSvc(nc *nats.Conn) {
 		case <-checkInWMITicker.C:
 			a.NatsMessage(nc, "agent-wmi")
 		case <-syncMeshTicker.C:
-			a.SyncMeshNodeID(false)
+			if syncMeshRunning.CompareAndSwap(false, true) {
+				go func() {
+					defer syncMeshRunning.Store(false)
+					a.SyncMeshNodeID(false)
+				}()
+			} else {
+				a.Logger.Debugln("syncMeshTicker SyncMeshNodeID already running, skipping tick")
+			}
 		case <-fileTransferReaperTicker.C:
 			a.ReapStaleFileTransferSessions()
 		case <-extraC:

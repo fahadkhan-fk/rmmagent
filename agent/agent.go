@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"hash"
 	"math"
+	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -604,8 +605,15 @@ func (a *Agent) setupNatsOptions() []nats.Option {
 		}
 	}
 
+	opts = append(opts, nats.ConnectHandler(func(nc *nats.Conn) {
+		a.Logger.Debugln("NATS connected to", nc.ConnectedUrl())
+	}))
 	opts = append(opts, nats.DisconnectErrHandler(func(nc *nats.Conn, err error) {
-		a.Logger.Debugln("NATS disconnected:", err)
+		if err != nil {
+			a.Logger.Errorf("NATS disconnected from %s: %v", a.NatsServer, err)
+		} else {
+			a.Logger.Debugln("NATS disconnected")
+		}
 		a.Logger.Debugf("%+v\n", nc.Statistics)
 	}))
 	opts = append(opts, nats.ReconnectHandler(func(nc *nats.Conn) {
@@ -731,7 +739,13 @@ func createWinTempDir() error {
 	return nil
 }
 
-func (a *Agent) RunTask(id int) error {
+func (a *Agent) RunTask(id int, jitter bool) error {
+	if jitter {
+		delay := time.Duration(rand.Int63n(int64(15 * time.Second)))
+		a.Logger.Debugf("Applying startup jitter before task id %d: sleeping for %s seconds", id, delay)
+		time.Sleep(delay)
+	}
+
 	data := rmm.AutomatedTask{}
 	url := fmt.Sprintf("/api/v3/%d/%s/taskrunner/", id, a.AgentID)
 	r1, gerr := a.rClient.R().Get(url)
