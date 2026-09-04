@@ -79,6 +79,7 @@ type Agent struct {
 	Version                    string
 	Debug                      bool
 	rClient                    *resty.Client
+	fileTransferClient         *resty.Client
 	Proxy                      string
 	LogTo                      string
 	LogFile                    *os.File
@@ -205,6 +206,22 @@ func New(logger *logrus.Logger, version string) *Agent {
 		restyC.SetRootCertificate(ac.Cert)
 	}
 
+	ftClient := resty.New()
+	ftClient.SetBaseURL(ac.BaseURL)
+	ftClient.SetCloseConnection(true)
+	ftClient.SetHeaders(headers)
+	ftClient.SetTimeout(0)
+	ftClient.SetDebug(logger.IsLevelEnabled(logrus.DebugLevel))
+	if insecure {
+		ftClient.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	if len(ac.Proxy) > 0 {
+		ftClient.SetProxy(ac.Proxy)
+	}
+	if len(ac.Cert) > 0 {
+		ftClient.SetRootCertificate(ac.Cert)
+	}
+
 	if len(ac.WinTmpDir) > 0 {
 		winTempDir = ac.WinTmpDir
 	}
@@ -300,6 +317,7 @@ func New(logger *logrus.Logger, version string) *Agent {
 		Version:                  version,
 		Debug:                    logger.IsLevelEnabled(logrus.DebugLevel),
 		rClient:                  restyC,
+		fileTransferClient:       ftClient,
 		Proxy:                    ac.Proxy,
 		Platform:                 runtime.GOOS,
 		GoArch:                   runtime.GOARCH,

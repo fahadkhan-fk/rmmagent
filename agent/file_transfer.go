@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -17,7 +19,13 @@ import (
 )
 
 const (
-	downloadPutTimeout             = 90 * time.Second
+	downloadPutTimeout             = 120 * time.Second
+	uploadChunkGetTimeout          = 120 * time.Second
+	uploadChunkAckTimeout          = 60 * time.Second
+	fileTransferFailTimeout        = 30 * time.Second
+	downloadPushMaxAttempts        = 5
+	downloadPushRetryMinBackoff    = 500 * time.Millisecond
+	downloadPushRetryMaxBackoff    = 8 * time.Second
 	fileTransferSessionIdleTimeout = 10 * time.Minute
 	fileTransferReaperInterval     = 2 * time.Minute
 	fileTransferPartialRetention   = 1 * time.Hour
@@ -25,6 +33,17 @@ const (
 	fileTransferDrainMaxBackoff    = 500 * time.Millisecond
 	fileTransferDrainIdleTimeout   = 15 * time.Second
 )
+
+var downloadChunkExpectedOffsetRe = regexp.MustCompile(
+	`does not match expected (\d+)`,
+)
+
+func (a *Agent) fileTransferHTTP() *resty.Client {
+	if a.fileTransferClient != nil {
+		return a.fileTransferClient
+	}
+	return a.rClient
+}
 
 type UploadTransferSession struct {
 	SessionID       string
@@ -287,9 +306,12 @@ func (a *Agent) drainUploadChunks(sessionID string) (int64, error) {
 
 	for committedOffset < totalSize {
 		fetchStart := time.Now()
-		resp, err := a.rClient.R().
+		ctx, cancel := context.WithTimeout(context.Background(), uploadChunkGetTimeout)
+		resp, err := a.fileTransferHTTP().R().
 			SetDebug(false).
+			SetContext(ctx).
 			Get(url)
+		cancel()
 		if err != nil {
 			return committedOffset, fmt.Errorf("failed to pull upload chunk: %w", err)
 		}
@@ -435,7 +457,12 @@ func (a *Agent) ackUploadChunk(sessionID string, committedOffset int64) error {
 	url := fmt.Sprintf("/api/v3/file-transfers/%s/ack/", sessionID)
 	payload := map[string]int64{"committed_offset": committedOffset}
 
-	resp, err := a.rClient.R().SetBody(payload).Post(url)
+	ctx, cancel := context.WithTimeout(context.Background(), uploadChunkAckTimeout)
+	defer cancel()
+	resp, err := a.fileTransferHTTP().R().
+		SetContext(ctx).
+		SetBody(payload).
+		Post(url)
 	if err != nil {
 		return fmt.Errorf("failed to ack upload chunk: %w", err)
 	}
@@ -736,6 +763,9 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 
 func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, startOffset int64) {
 	offset := startOffset
+	backoff := downloadPushRetryMinBackoff
+	attempt := 0
+
 	for {
 		select {
 		case <-stop:
@@ -762,14 +792,160 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 		}
 
 		offeredOffset, err := a.pushDownloadChunk(sessionID, offset)
-		if err != nil {
+		if err == nil {
+			offset = offeredOffset
+			attempt = 0
+			backoff = downloadPushRetryMinBackoff
+			continue
+		}
+
+		if synced, ok := parseExpectedDownloadOffset(err); ok && synced > offset {
+			a.Logger.Warnf(
+				"file_transfer download stream session=%s re-sync offset %d → %d (%v)",
+				sessionID, offset, synced, err,
+			)
+			offset = synced
+			attempt = 0
+			backoff = downloadPushRetryMinBackoff
+			continue
+		}
+
+		if !isRetryableDownloadPushError(err) {
 			a.Logger.Errorf(
-				"file_transfer download stream session=%s offset=%d err=%v",
+				"file_transfer download stream session=%s offset=%d fatal err=%v",
 				sessionID, offset, err,
 			)
+			a.failDownloadStream(sessionID, err)
 			return
 		}
-		offset = offeredOffset
+
+		attempt++
+		if attempt >= downloadPushMaxAttempts {
+			a.Logger.Errorf(
+				"file_transfer download stream session=%s offset=%d exhausted retries err=%v",
+				sessionID, offset, err,
+			)
+			a.failDownloadStream(sessionID, err)
+			return
+		}
+
+		a.Logger.Warnf(
+			"file_transfer download stream session=%s offset=%d retry %d/%d after %v: %v",
+			sessionID, offset, attempt, downloadPushMaxAttempts, backoff, err,
+		)
+
+		timer := time.NewTimer(backoff)
+		select {
+		case <-stop:
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+		backoff *= 2
+		if backoff > downloadPushRetryMaxBackoff {
+			backoff = downloadPushRetryMaxBackoff
+		}
+	}
+}
+
+func parseExpectedDownloadOffset(err error) (int64, bool) {
+	if err == nil {
+		return 0, false
+	}
+	m := downloadChunkExpectedOffsetRe.FindStringSubmatch(err.Error())
+	if len(m) != 2 {
+		return 0, false
+	}
+	n, perr := strconv.ParseInt(m[1], 10, 64)
+	if perr != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
+}
+
+func isRetryableDownloadPushError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "download session not found") ||
+		strings.Contains(msg, "file handle is missing") ||
+		strings.Contains(msg, "failed to read chunk") ||
+		strings.Contains(msg, "short read") {
+		return false
+	}
+
+	if strings.Contains(msg, "push download chunk failed: 4") {
+		if strings.Contains(msg, "failed: 408") ||
+			strings.Contains(msg, "failed: 425") ||
+			strings.Contains(msg, "failed: 429") {
+			return true
+		}
+		return false
+	}
+	// Network / timeout / 5xx / context deadline.
+	return true
+}
+
+func (a *Agent) failDownloadStream(sessionID string, cause error) {
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok := a.DownloadTransferSessions[sessionID]
+	if ok && session != nil {
+		delete(a.DownloadTransferSessions, sessionID)
+	} else {
+		session = nil
+	}
+	a.DownloadTransferSessionsMu.Unlock()
+
+	if session != nil {
+		if session.StopStream != nil {
+			select {
+			case <-session.StopStream:
+			default:
+				close(session.StopStream)
+			}
+		}
+		if session.File != nil {
+			_ = session.File.Close()
+			session.File = nil
+		}
+		if session.RemoveOnClose && session.SourcePath != "" {
+			if err := os.Remove(session.SourcePath); err != nil && !os.IsNotExist(err) {
+				a.Logger.Warnf(
+					"file_transfer download fail cleanup archive=%s session=%s err=%v",
+					session.SourcePath, sessionID, err,
+				)
+			}
+		}
+	}
+
+	msg := "download stream failed"
+	if cause != nil {
+		msg = cause.Error()
+	}
+	a.reportFileTransferFailure(sessionID, msg)
+}
+
+func (a *Agent) reportFileTransferFailure(sessionID, message string) {
+	url := fmt.Sprintf("/api/v3/file-transfers/%s/fail/", sessionID)
+	payload := map[string]string{"error": message}
+	ctx, cancel := context.WithTimeout(context.Background(), fileTransferFailTimeout)
+	defer cancel()
+	resp, err := a.fileTransferHTTP().R().
+		SetContext(ctx).
+		SetBody(payload).
+		Post(url)
+	if err != nil {
+		a.Logger.Errorf(
+			"file_transfer fail callback session=%s err=%v", sessionID, err,
+		)
+		return
+	}
+	if resp.StatusCode() != 200 && resp.StatusCode() != 409 {
+		a.Logger.Warnf(
+			"file_transfer fail callback session=%s status=%d body=%s",
+			sessionID, resp.StatusCode(), string(resp.Body()),
+		)
 	}
 }
 
@@ -819,7 +995,7 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 	defer cancel()
 
 	putStart := time.Now()
-	resp, err := a.rClient.R().
+	resp, err := a.fileTransferHTTP().R().
 		SetDebug(false).
 		SetContext(ctx).
 		SetHeader("Content-Range", contentRange).
@@ -838,16 +1014,23 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 		)
 	}
 
+	offeredOffset := end + 1
+	var result struct {
+		OfferedOffset int64 `json:"offered_offset"`
+	}
+	if err := json.Unmarshal(resp.Body(), &result); err == nil && result.OfferedOffset > 0 {
+		offeredOffset = result.OfferedOffset
+	}
+
 	a.DownloadTransferSessionsMu.Lock()
 	if s, ok := a.DownloadTransferSessions[sessionID]; ok && s != nil {
 		if s.Hasher != nil && offset == s.HashedOffset {
 			s.Hasher.Write(buf[:n])
-			s.HashedOffset = end + 1
+			s.HashedOffset = offeredOffset
 		}
 	}
 	a.DownloadTransferSessionsMu.Unlock()
 
-	offeredOffset := end + 1
 	a.Logger.Infof(
 		"file_transfer download chunk pushed session=%s offset=%d end=%d read_ms=%d put_ms=%d",
 		sessionID, offset, end, readMs, putMs,

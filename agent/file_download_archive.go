@@ -2,6 +2,7 @@ package agent
 
 import (
 	"archive/zip"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -528,7 +529,9 @@ func (a *Agent) reportArchiveReady(
 	const maxAttempts = 4
 	backoff := 2 * time.Second
 	for attempt := 1; ; attempt++ {
-		resp, err := a.rClient.R().SetBody(payload).Post(url)
+		ctx, cancel := context.WithTimeout(context.Background(), fileTransferFailTimeout)
+		resp, err := a.fileTransferHTTP().R().SetContext(ctx).SetBody(payload).Post(url)
+		cancel()
 		if err == nil && resp.StatusCode() == 200 {
 			return true
 		}
@@ -561,7 +564,9 @@ func (a *Agent) reportArchiveReady(
 func (a *Agent) reportArchiveError(sessionID, message string) {
 	url := fmt.Sprintf("/api/v3/file-transfers/%s/archive-ready/", sessionID)
 	payload := map[string]interface{}{"error": message}
-	if _, err := a.rClient.R().SetBody(payload).Post(url); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), fileTransferFailTimeout)
+	defer cancel()
+	if _, err := a.fileTransferHTTP().R().SetContext(ctx).SetBody(payload).Post(url); err != nil {
 		a.Logger.Errorf(
 			"file_transfer archive-error callback session=%s err=%v", sessionID, err,
 		)
