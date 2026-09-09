@@ -1144,6 +1144,11 @@ func (a *Agent) RunRPC() {
 				msg.Respond(resp)
 			}(payload)
 
+		case "files_download_ack":
+			go func(p *NatsMsg) {
+				a.HandleDownloadAck(p)
+			}(payload)
+
 		case "files_download_prepare":
 			go func(p *NatsMsg) {
 				var resp []byte

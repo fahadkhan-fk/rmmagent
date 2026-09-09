@@ -20,12 +20,16 @@ import (
 
 const (
 	downloadPutTimeout             = 120 * time.Second
+	downloadReadyGetTimeout        = 15 * time.Second
 	uploadChunkGetTimeout          = 120 * time.Second
 	uploadChunkAckTimeout          = 60 * time.Second
 	fileTransferFailTimeout        = 30 * time.Second
-	downloadPushMaxAttempts        = 5
+	downloadPushMaxAttempts        = 12
 	downloadPushRetryMinBackoff    = 500 * time.Millisecond
 	downloadPushRetryMaxBackoff    = 8 * time.Second
+	downloadPushAckFallbackPoll    = 5 * time.Second
+	downloadPushAckWaitMax         = 120 * time.Second
+	downloadPushAckWaitLogEvery    = 5 * time.Second
 	fileTransferSessionIdleTimeout = 10 * time.Minute
 	fileTransferReaperInterval     = 2 * time.Minute
 	fileTransferPartialRetention   = 1 * time.Hour
@@ -663,10 +667,65 @@ type DownloadTransferSession struct {
 	ChunkSize     int64
 	File          *os.File
 	StopStream    chan struct{}
+	AckCh         chan struct{}
 	LastActivity  time.Time
 	Hasher        hash.Hash
 	HashedOffset  int64
 	RemoveOnClose bool
+}
+
+func (a *Agent) HandleDownloadAck(p *NatsMsg) {
+	sessionID, err := parsePayloadString(p.Data, "session_id")
+	if err != nil {
+		return
+	}
+
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok := a.DownloadTransferSessions[sessionID]
+	var ackCh chan struct{}
+	if ok && session != nil {
+		ackCh = session.AckCh
+		session.LastActivity = time.Now()
+	}
+	a.DownloadTransferSessionsMu.Unlock()
+	if ackCh == nil {
+		return
+	}
+
+	select {
+	case ackCh <- struct{}{}:
+	default:
+	}
+}
+
+func (a *Agent) waitForDownloadAckSlot(sessionID string, stop <-chan struct{}) bool {
+	var ackCh chan struct{}
+	a.DownloadTransferSessionsMu.Lock()
+	if s, ok := a.DownloadTransferSessions[sessionID]; ok && s != nil {
+		ackCh = s.AckCh
+	}
+	a.DownloadTransferSessionsMu.Unlock()
+
+	timer := time.NewTimer(downloadPushAckFallbackPoll)
+	defer timer.Stop()
+
+	if ackCh == nil {
+		select {
+		case <-stop:
+			return false
+		case <-timer.C:
+			return true
+		}
+	}
+
+	select {
+	case <-stop:
+		return false
+	case <-ackCh:
+		return true
+	case <-timer.C:
+		return true
+	}
 }
 
 func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error) {
@@ -745,6 +804,7 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		ChunkSize:     chunkSize,
 		File:          file,
 		StopStream:    stopStream,
+		AckCh:         make(chan struct{}, 1),
 		LastActivity:  time.Now(),
 		Hasher:        hasher,
 		HashedOffset:  startOffset,
@@ -765,6 +825,8 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 	offset := startOffset
 	backoff := downloadPushRetryMinBackoff
 	attempt := 0
+	var ackWaitStarted time.Time
+	var lastAckWaitLog time.Time
 
 	for {
 		select {
@@ -791,11 +853,103 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 			return
 		}
 
+		ready, err := a.getDownloadChunkReady(sessionID)
+		if err != nil {
+			if !isRetryableDownloadPushError(err) {
+				a.Logger.Errorf(
+					"file_transfer download stream session=%s offset=%d fatal ready err=%v",
+					sessionID, offset, err,
+				)
+				a.failDownloadStream(sessionID, err)
+				return
+			}
+			ackWaitStarted = time.Time{}
+			attempt++
+			if attempt >= downloadPushMaxAttempts {
+				a.Logger.Errorf(
+					"file_transfer download stream session=%s offset=%d exhausted ready retries err=%v",
+					sessionID, offset, err,
+				)
+				a.failDownloadStream(sessionID, err)
+				return
+			}
+			a.Logger.Warnf(
+				"file_transfer download stream session=%s offset=%d ready retry %d/%d backoff=%s err=%v",
+				sessionID, offset, attempt, downloadPushMaxAttempts, backoff, err,
+			)
+			timer := time.NewTimer(backoff)
+			select {
+			case <-stop:
+				timer.Stop()
+				return
+			case <-timer.C:
+			}
+			backoff *= 2
+			if backoff > downloadPushRetryMaxBackoff {
+				backoff = downloadPushRetryMaxBackoff
+			}
+			continue
+		}
+
+		attempt = 0
+		backoff = downloadPushRetryMinBackoff
+
+		switch ready.Status {
+		case "cancelled", "completed", "failed", "expired":
+			a.Logger.Debugf(
+				"file_transfer download stream session=%s stopped status=%s",
+				sessionID, ready.Status,
+			)
+			return
+		}
+
+		if ready.OfferedOffset > offset {
+			a.Logger.Warnf(
+				"file_transfer download stream session=%s re-sync offset %d → %d",
+				sessionID, offset, ready.OfferedOffset,
+			)
+			offset = ready.OfferedOffset
+			attempt = 0
+			backoff = downloadPushRetryMinBackoff
+			ackWaitStarted = time.Time{}
+			continue
+		}
+
+		if !ready.CanPut {
+			if ackWaitStarted.IsZero() {
+				ackWaitStarted = time.Now()
+			}
+			if time.Since(ackWaitStarted) >= downloadPushAckWaitMax {
+				a.Logger.Errorf(
+					"file_transfer download stream session=%s offset=%d exhausted waiting for client ACK",
+					sessionID, offset,
+				)
+				a.failDownloadStream(
+					sessionID,
+					fmt.Errorf("timed out waiting for client ACK at offset %d", offset),
+				)
+				return
+			}
+			if lastAckWaitLog.IsZero() || time.Since(lastAckWaitLog) >= downloadPushAckWaitLogEvery {
+				a.Logger.Debugf(
+					"file_transfer download stream session=%s offset=%d waiting for client ACK (%s)",
+					sessionID, offset, time.Since(ackWaitStarted).Round(time.Millisecond),
+				)
+				lastAckWaitLog = time.Now()
+			}
+			if !a.waitForDownloadAckSlot(sessionID, stop) {
+				return
+			}
+			continue
+		}
+
+		offset = ready.OfferedOffset
 		offeredOffset, err := a.pushDownloadChunk(sessionID, offset)
 		if err == nil {
 			offset = offeredOffset
 			attempt = 0
 			backoff = downloadPushRetryMinBackoff
+			ackWaitStarted = time.Time{}
 			continue
 		}
 
@@ -807,6 +961,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 			offset = synced
 			attempt = 0
 			backoff = downloadPushRetryMinBackoff
+			ackWaitStarted = time.Time{}
 			continue
 		}
 
@@ -819,6 +974,32 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 			return
 		}
 
+		if isDownloadPushAckWaitError(err) {
+			if ackWaitStarted.IsZero() {
+				ackWaitStarted = time.Now()
+			}
+			if time.Since(ackWaitStarted) >= downloadPushAckWaitMax {
+				a.Logger.Errorf(
+					"file_transfer download stream session=%s offset=%d exhausted waiting for client ACK: %v",
+					sessionID, offset, err,
+				)
+				a.failDownloadStream(sessionID, err)
+				return
+			}
+			if lastAckWaitLog.IsZero() || time.Since(lastAckWaitLog) >= downloadPushAckWaitLogEvery {
+				a.Logger.Debugf(
+					"file_transfer download stream session=%s offset=%d waiting for client ACK (%s)",
+					sessionID, offset, time.Since(ackWaitStarted).Round(time.Millisecond),
+				)
+				lastAckWaitLog = time.Now()
+			}
+			if !a.waitForDownloadAckSlot(sessionID, stop) {
+				return
+			}
+			continue
+		}
+
+		ackWaitStarted = time.Time{}
 		attempt++
 		if attempt >= downloadPushMaxAttempts {
 			a.Logger.Errorf(
@@ -875,7 +1056,8 @@ func isRetryableDownloadPushError(err error) bool {
 		return false
 	}
 
-	if strings.Contains(msg, "push download chunk failed: 4") {
+	if strings.Contains(msg, "push download chunk failed: 4") ||
+		strings.Contains(msg, "download chunk ready failed: 4") {
 		if strings.Contains(msg, "failed: 408") ||
 			strings.Contains(msg, "failed: 425") ||
 			strings.Contains(msg, "failed: 429") {
@@ -885,6 +1067,15 @@ func isRetryableDownloadPushError(err error) bool {
 	}
 	// Network / timeout / 5xx / context deadline.
 	return true
+}
+
+func isDownloadPushAckWaitError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "failed: 408") &&
+		strings.Contains(msg, "Timed out waiting for client to ACK")
 }
 
 func (a *Agent) failDownloadStream(sessionID string, cause error) {
@@ -947,6 +1138,41 @@ func (a *Agent) reportFileTransferFailure(sessionID, message string) {
 			sessionID, resp.StatusCode(), string(resp.Body()),
 		)
 	}
+}
+
+type downloadChunkReady struct {
+	Status          string `json:"status"`
+	CommittedOffset int64  `json:"committed_offset"`
+	OfferedOffset   int64  `json:"offered_offset"`
+	ChunkSize       int64  `json:"chunk_size"`
+	TotalSize       int64  `json:"total_size"`
+	CanPut          bool   `json:"can_put"`
+}
+
+func (a *Agent) getDownloadChunkReady(sessionID string) (downloadChunkReady, error) {
+	var ready downloadChunkReady
+	url := fmt.Sprintf("/api/v3/file-transfers/%s/download-chunk/", sessionID)
+	ctx, cancel := context.WithTimeout(context.Background(), downloadReadyGetTimeout)
+	defer cancel()
+
+	resp, err := a.fileTransferHTTP().R().
+		SetDebug(false).
+		SetContext(ctx).
+		Get(url)
+	if err != nil {
+		return ready, fmt.Errorf("failed to get download chunk ready: %w", err)
+	}
+	if resp.StatusCode() != 200 {
+		return ready, fmt.Errorf(
+			"download chunk ready failed: %d %s",
+			resp.StatusCode(),
+			string(resp.Body()),
+		)
+	}
+	if err := json.Unmarshal(resp.Body(), &ready); err != nil {
+		return ready, fmt.Errorf("download chunk ready: invalid response: %w", err)
+	}
+	return ready, nil
 }
 
 func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error) {

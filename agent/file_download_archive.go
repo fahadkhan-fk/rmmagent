@@ -508,6 +508,7 @@ func (a *Agent) buildAndServeArchive(
 		Hasher:        hasher,
 		HashedOffset:  0,
 		RemoveOnClose: true,
+		AckCh:         make(chan struct{}, 1),
 	}
 	a.DownloadTransferSessionsMu.Unlock()
 
