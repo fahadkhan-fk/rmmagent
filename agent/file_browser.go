@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -16,6 +17,7 @@ import (
 const (
 	fileBrowserDefaultPageSize      = 500
 	fileBrowserMaxPageSize          = 1000
+	fileBrowserMaxPage              = 10_000
 	fileBrowserFilterSnapshotTTL    = 60 * time.Second
 	fileBrowserFilterSnapshotMax    = 32
 	fileBrowserFilterMaxLen         = 255
@@ -149,10 +151,7 @@ func parseFileBrowserPageParams(data map[string]string) (int, int) {
 	if v, err := strconv.Atoi(strings.TrimSpace(data["page_size"])); err == nil && v >= 1 {
 		pageSize = v
 	}
-	if pageSize > fileBrowserMaxPageSize {
-		pageSize = fileBrowserMaxPageSize
-	}
-	return page, pageSize
+	return normalizeFileBrowserPage(page, pageSize)
 }
 
 func parseFileBrowserNameFilter(data map[string]string) string {
@@ -258,14 +257,34 @@ func nameMatchesFileBrowserFilter(name, filter string) bool {
 	return strings.Contains(strings.ToLower(name), strings.ToLower(filter))
 }
 
+func mulNonNeg(a, b int) (int, bool) {
+	if a < 0 || b < 0 {
+		return 0, false
+	}
+	if a == 0 || b == 0 {
+		return 0, true
+	}
+	if a > math.MaxInt/b {
+		return 0, false
+	}
+	product := a * b
+	if product < 0 {
+		return 0, false
+	}
+	return product, true
+}
+
 func paginateFileBrowserItems(items []fileBrowserItem, page, pageSize int) (encoded []map[string]interface{}, total int, hasMore bool) {
 	total = len(items)
-	start := (page - 1) * pageSize
-	if start > total {
-		start = total
+	encoded = make([]map[string]interface{}, 0)
+	page, pageSize = normalizeFileBrowserPage(page, pageSize)
+
+	start, ok := mulNonNeg(page-1, pageSize)
+	if !ok || start >= total {
+		return encoded, total, false
 	}
 	end := start + pageSize
-	if end > total {
+	if end < start || end > total {
 		end = total
 	}
 	hasMore = end < total
@@ -400,6 +419,9 @@ func compareFileBrowserItems(a, b fileBrowserItem) int {
 func normalizeFileBrowserPage(page, pageSize int) (int, int) {
 	if page < 1 {
 		page = 1
+	}
+	if page > fileBrowserMaxPage {
+		page = fileBrowserMaxPage
 	}
 	if pageSize < 1 {
 		pageSize = fileBrowserDefaultPageSize
