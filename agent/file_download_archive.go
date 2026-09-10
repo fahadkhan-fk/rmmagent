@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strings"
 	"time"
@@ -112,7 +113,36 @@ func parseArchiveLimits(data map[string]string) archiveLimits {
 	return limits
 }
 
-func archiveTempPath(sessionID string) string {
+func sameFileTransferDir(a, b string) bool {
+	a, b = filepath.Clean(a), filepath.Clean(b)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(a, b)
+	}
+	return a == b
+}
+
+func (a *Agent) fileTransferTempDir() string {
+	if runtime.GOOS == "windows" {
+		if a != nil && strings.TrimSpace(a.WinTmpDir) != "" {
+			return a.WinTmpDir
+		}
+		return defaultWinTmpDir
+	}
+	if a != nil && strings.TrimSpace(a.UnixTmpDir) != "" {
+		return a.UnixTmpDir
+	}
+	return os.TempDir()
+}
+
+func (a *Agent) ensureFileTransferTempDir() (string, error) {
+	dir := a.fileTransferTempDir()
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return "", fmt.Errorf("failed to create file transfer temp dir %s: %w", dir, err)
+	}
+	return dir, nil
+}
+
+func (a *Agent) archiveTempPath(sessionID string) (string, error) {
 	safeID := strings.Map(func(r rune) rune {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-':
@@ -121,18 +151,30 @@ func archiveTempPath(sessionID string) string {
 			return '_'
 		}
 	}, sessionID)
-	return filepath.Join(os.TempDir(), fmt.Sprintf("%s%s.zip", archiveTempPrefix, safeID))
+	dir, err := a.ensureFileTransferTempDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, fmt.Sprintf("%s%s.zip", archiveTempPrefix, safeID)), nil
 }
 
-func isArchiveTempPath(p string) bool {
+func isArchiveTempName(base string) bool {
+	return strings.HasPrefix(base, archiveTempPrefix) && strings.HasSuffix(base, ".zip")
+}
+
+func (a *Agent) isArchiveTempPath(p string) bool {
 	if p == "" {
 		return false
 	}
 	base := filepath.Base(p)
-	if !strings.HasPrefix(base, archiveTempPrefix) || !strings.HasSuffix(base, ".zip") {
+	if !isArchiveTempName(base) {
 		return false
 	}
-	return filepath.Clean(filepath.Dir(p)) == filepath.Clean(os.TempDir())
+	dir := filepath.Dir(p)
+	if sameFileTransferDir(dir, a.fileTransferTempDir()) {
+		return true
+	}
+	return sameFileTransferDir(dir, os.TempDir())
 }
 
 func dedupeZipEntryName(name string, used map[string]struct{}) string {
@@ -446,7 +488,12 @@ func (a *Agent) PrepareFilesDownloadArchive(p *NatsMsg) (map[string]interface{},
 func (a *Agent) buildAndServeArchive(
 	sessionID string, paths []string, chunkSize int64, limits archiveLimits,
 ) {
-	tempPath := archiveTempPath(sessionID)
+	tempPath, err := a.archiveTempPath(sessionID)
+	if err != nil {
+		a.Logger.Errorln("files_download_archive temp dir:", err)
+		a.reportArchiveError(sessionID, err.Error())
+		return
+	}
 	a.DownloadTransferSessionsMu.Lock()
 	if existing, ok := a.DownloadTransferSessions[sessionID]; ok && existing != nil {
 		if existing.StopStream != nil {
@@ -574,13 +621,10 @@ func (a *Agent) reportArchiveError(sessionID, message string) {
 	}
 }
 
-// SweepOrphanedArchives removes orphaned temporary ZIP archives left behind by previous agent runs
-// (example: after a crash during archive creation or transfer).
-func (a *Agent) SweepOrphanedArchives() {
-	dir := os.TempDir()
+func sweepArchiveTempDir(dir string) int {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
-		return
+		return 0
 	}
 	removed := 0
 	for _, e := range entries {
@@ -588,14 +632,23 @@ func (a *Agent) SweepOrphanedArchives() {
 			continue
 		}
 		name := e.Name()
-		if !strings.HasPrefix(name, archiveTempPrefix) || !strings.HasSuffix(name, ".zip") {
+		if !isArchiveTempName(name) {
 			continue
 		}
 		if err := os.Remove(filepath.Join(dir, name)); err == nil {
 			removed++
 		}
 	}
-	if removed > 0 {
+	return removed
+}
+
+func (a *Agent) SweepOrphanedArchives() {
+	removed := sweepArchiveTempDir(a.fileTransferTempDir())
+	osTmp := os.TempDir()
+	if !sameFileTransferDir(osTmp, a.fileTransferTempDir()) {
+		removed += sweepArchiveTempDir(osTmp)
+	}
+	if removed > 0 && a.Logger != nil {
 		a.Logger.Infof("file_transfer startup: removed %d orphaned archive temp file(s)", removed)
 	}
 }
