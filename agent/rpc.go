@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"os"
 	"runtime"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -53,6 +54,23 @@ var (
 	getWinUpdateLocker     uint32
 	installWinUpdateLocker uint32
 )
+
+func (a *Agent) recoverFilesRPC(op string, msg *nats.Msg) {
+	r := recover()
+	if r == nil {
+		return
+	}
+	if a != nil && a.Logger != nil {
+		a.Logger.Errorf("%s: panic: %v\n%s", op, r, debug.Stack())
+	}
+	if msg == nil {
+		return
+	}
+	var resp []byte
+	ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+	_ = ret.Encode(map[string]interface{}{"error": fmt.Sprintf("internal error in %s", op)})
+	_ = msg.Respond(resp)
+}
 
 func (a *Agent) RunRPC() {
 	a.Logger.Infoln("Agent service started")
@@ -917,6 +935,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_list":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_list", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 				path := strings.TrimSpace(p.Data["path"])
@@ -944,6 +963,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_properties":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_properties", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -977,6 +997,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_mkdir":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_mkdir", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1016,6 +1037,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_rename":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_rename", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1055,6 +1077,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_delete":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_delete", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1086,6 +1109,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_upload_prepare":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_upload_prepare", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1101,6 +1125,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_upload_chunk_available":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_upload_chunk_available", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1116,6 +1141,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_upload_finalize":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_upload_finalize", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1131,6 +1157,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_upload_abort":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_upload_abort", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1146,11 +1173,13 @@ func (a *Agent) RunRPC() {
 
 		case "files_download_ack":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_download_ack", nil)
 				a.HandleDownloadAck(p)
 			}(payload)
 
 		case "files_download_prepare":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_download_prepare", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1166,6 +1195,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_download_finalize":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_download_finalize", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
@@ -1181,6 +1211,7 @@ func (a *Agent) RunRPC() {
 
 		case "files_download_archive_prepare":
 			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_download_archive_prepare", msg)
 				var resp []byte
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 
