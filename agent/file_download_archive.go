@@ -358,7 +358,7 @@ func writeArchiveZip(
 		return warnings, err
 	}
 
-	out, err := os.Create(tempPath)
+	out, err := createExclusiveReplaceRegularFile(tempPath, 0o644)
 	if err != nil {
 		return warnings, fmt.Errorf("failed to create archive file: %w", err)
 	}

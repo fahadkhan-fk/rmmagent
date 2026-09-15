@@ -142,41 +142,113 @@ func parsePayloadResume(data map[string]string) (bool, int64) {
 	return resume, offset
 }
 
+func requireRegularFileInfo(info os.FileInfo) error {
+	if info == nil {
+		return fmt.Errorf("path is not a regular file")
+	}
+	mode := info.Mode()
+	if mode&os.ModeSymlink != 0 {
+		return fmt.Errorf("path is a symlink")
+	}
+	if !mode.IsRegular() {
+		return fmt.Errorf("path is not a regular file")
+	}
+	return nil
+}
+
+func verifyOpenedRegularFile(f *os.File) error {
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	return requireRegularFileInfo(info)
+}
+
+func createExclusiveRegularFile(path string, perm os.FileMode) (*os.File, error) {
+	f, err := openFileNoFollow(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, perm)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyOpenedRegularFile(f); err != nil {
+		_ = f.Close()
+		_ = os.Remove(path)
+		return nil, err
+	}
+	return f, nil
+}
+
+func createExclusiveReplaceRegularFile(path string, perm os.FileMode) (*os.File, error) {
+	info, err := os.Lstat(path)
+	if err == nil {
+		if err := requireRegularFileInfo(info); err != nil {
+			return nil, fmt.Errorf("refusing to use %s: %w", path, err)
+		}
+		if err := os.Remove(path); err != nil {
+			return nil, err
+		}
+	} else if !os.IsNotExist(err) {
+		return nil, err
+	}
+	return createExclusiveRegularFile(path, perm)
+}
+
+func openExistingRegularFile(path string) (*os.File, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireRegularFileInfo(info); err != nil {
+		return nil, err
+	}
+	f, err := openFileNoFollow(path, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	if err := verifyOpenedRegularFile(f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	return f, nil
+}
+
 func prepareUploadPartialFile(
 	partialPath string, resume bool, resumeOffset, totalSize int64,
 ) (*os.File, int64, error) {
-	if !resume {
-		file, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-		if err != nil {
-			return nil, 0, fmt.Errorf("failed to create partial file: %w", err)
+	if resume {
+		if resumeOffset < 0 || resumeOffset > totalSize {
+			return nil, 0, fmt.Errorf("invalid resume offset")
 		}
-		return file, 0, nil
+		info, err := os.Lstat(partialPath)
+		if err != nil {
+			return nil, 0, fmt.Errorf("cannot resume upload, partial file missing: %w", err)
+		}
+		if err := requireRegularFileInfo(info); err != nil {
+			return nil, 0, fmt.Errorf("cannot resume upload, refusing partial path: %w", err)
+		}
+		if info.Size() < resumeOffset {
+			return nil, 0, fmt.Errorf("partial file is shorter than resume offset")
+		}
+
+		file, err := openExistingRegularFile(partialPath)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to open partial file: %w", err)
+		}
+		if err := file.Truncate(resumeOffset); err != nil {
+			_ = file.Close()
+			return nil, 0, fmt.Errorf("failed to truncate partial file: %w", err)
+		}
+		return file, resumeOffset, nil
 	}
 
-	if resumeOffset < 0 || resumeOffset > totalSize {
-		return nil, 0, fmt.Errorf("invalid resume offset")
-	}
-	info, err := os.Stat(partialPath)
+	file, err := createExclusiveReplaceRegularFile(partialPath, 0o644)
 	if err != nil {
-		return nil, 0, fmt.Errorf("cannot resume upload, partial file missing: %w", err)
+		return nil, 0, fmt.Errorf("failed to create partial file: %w", err)
 	}
-	if info.Size() < resumeOffset {
-		return nil, 0, fmt.Errorf("partial file is shorter than resume offset")
-	}
-
-	file, err := os.OpenFile(partialPath, os.O_CREATE|os.O_WRONLY, 0o644)
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to open partial file: %w", err)
-	}
-	if err := file.Truncate(resumeOffset); err != nil {
-		_ = file.Close()
-		return nil, 0, fmt.Errorf("failed to truncate partial file: %w", err)
-	}
-	return file, resumeOffset, nil
+	return file, 0, nil
 }
 
 func replaceUploadPartialWithDestination(partialPath, destinationPath string) error {
-	if _, err := os.Stat(destinationPath); err == nil {
+	if _, err := os.Lstat(destinationPath); err == nil {
 		if err := os.Remove(destinationPath); err != nil {
 			return fmt.Errorf("failed to remove existing destination file: %w", err)
 		}

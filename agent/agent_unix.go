@@ -1067,3 +1067,14 @@ func (a *Agent) Start(_ service.Service) error { return nil }
 func (a *Agent) Stop(_ service.Service) error { return nil }
 
 func (a *Agent) InstallService() error { return nil }
+
+func openFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error) {
+	fd, err := syscall.Open(path, flag|syscall.O_NOFOLLOW, uint32(perm))
+	if err != nil {
+		if err == syscall.ELOOP {
+			return nil, fmt.Errorf("path is a symlink")
+		}
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), path), nil
+}
