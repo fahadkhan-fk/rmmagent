@@ -24,7 +24,8 @@ const (
 	defaultArchiveMaxDepth     = 32
 	archiveDiskSpaceMargin     = int64(64 * 1024 * 1024)
 	// Prefix used for all temp archive files so a startup sweep can reclaim orphans.
-	archiveTempPrefix = "trmm-archive-"
+	archiveTempPrefix  = "trmm-archive-"
+	maxArchiveWarnings = 50
 )
 
 func ensureArchiveDiskSpace(dir string, needed int64) error {
@@ -341,6 +342,16 @@ func collectArchiveEntries(
 	return files, dirNames, warnings, totalBytes, nil
 }
 
+func appendArchiveWarning(warnings []string, msg string) []string {
+	if len(warnings) == maxArchiveWarnings {
+		return append(warnings, "additional items were skipped")
+	}
+	if len(warnings) > maxArchiveWarnings {
+		return warnings
+	}
+	return append(warnings, msg)
+}
+
 func writeArchiveZip(
 	tempPath string,
 	roots []string,
@@ -389,13 +400,27 @@ func writeArchiveZip(
 		}
 	}
 
+	addedFiles := 0
 	for _, entry := range files {
 		info, err := entryInfoFromPath(entry.absPath, entry.size)
 		if err != nil {
-			return warnings, fmt.Errorf("failed to stat %s: %w", entry.absPath, err)
+			warnings = appendArchiveWarning(
+				warnings, fmt.Sprintf("skipped %s: %v", entry.absPath, err),
+			)
+			continue
 		}
+
+		src, err := os.Open(entry.absPath)
+		if err != nil {
+			warnings = appendArchiveWarning(
+				warnings, fmt.Sprintf("skipped %s: %v", entry.absPath, err),
+			)
+			continue
+		}
+
 		header, err := zip.FileInfoHeader(info)
 		if err != nil {
+			_ = src.Close()
 			return warnings, fmt.Errorf("failed to create zip header for %s: %w", entry.absPath, err)
 		}
 		header.Name = entry.zipName
@@ -404,18 +429,20 @@ func writeArchiveZip(
 
 		writer, err := zw.CreateHeader(header)
 		if err != nil {
+			_ = src.Close()
 			return warnings, fmt.Errorf("failed to add %s: %w", entry.zipName, err)
 		}
 
-		src, err := os.Open(entry.absPath)
-		if err != nil {
-			return warnings, fmt.Errorf("permission denied or unreadable file %s: %w", entry.absPath, err)
-		}
-		if _, err := io.Copy(writer, src); err != nil {
-			_ = src.Close()
-			return warnings, fmt.Errorf("failed to write %s into archive: %w", entry.zipName, err)
-		}
+		_, copyErr := io.Copy(writer, src)
 		_ = src.Close()
+		if copyErr != nil {
+			return warnings, fmt.Errorf("failed to write %s into archive: %w", entry.zipName, copyErr)
+		}
+		addedFiles++
+	}
+
+	if addedFiles == 0 && len(dirNames) == 0 {
+		return warnings, fmt.Errorf("nothing to archive")
 	}
 
 	if err := zw.Close(); err != nil {
