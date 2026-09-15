@@ -511,6 +511,36 @@ func parseUploadChunkHeaders(resp *resty.Response) (int64, int64, error) {
 	return start, end, nil
 }
 
+func (a *Agent) markUploadDormant(sessionID string) {
+	now := time.Now()
+	a.FileTransferSessionsMu.Lock()
+	defer a.FileTransferSessionsMu.Unlock()
+	session, ok := a.FileTransferSessions[sessionID]
+	if !ok || session == nil {
+		return
+	}
+	session.File = nil
+	if session.DormantSince.IsZero() {
+		session.DormantSince = now
+	}
+}
+
+func (a *Agent) discardUploadSession(sessionID, partialPath string) {
+	if partialPath != "" {
+		if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
+			if a.Logger != nil {
+				a.Logger.Warnf(
+					"file_transfer upload session=%s: failed to remove partial %s: %v",
+					sessionID, partialPath, err,
+				)
+			}
+		}
+	}
+	a.FileTransferSessionsMu.Lock()
+	delete(a.FileTransferSessions, sessionID)
+	a.FileTransferSessionsMu.Unlock()
+}
+
 func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	sessionID, err := parsePayloadString(p.Data, "session_id")
 	if err != nil {
@@ -566,19 +596,19 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		if err := file.Close(); err != nil {
 			return nil, fmt.Errorf("failed to close partial file: %w", err)
 		}
-
-		a.FileTransferSessionsMu.Lock()
-		if session, ok := a.FileTransferSessions[sessionID]; ok && session != nil {
-			session.File = nil
-		}
-		a.FileTransferSessionsMu.Unlock()
 	}
+
+	a.markUploadDormant(sessionID)
 
 	info, err := os.Stat(partialPath)
 	if err != nil {
+		if os.IsNotExist(err) {
+			a.discardUploadSession(sessionID, "")
+		}
 		return nil, fmt.Errorf("failed to stat partial file: %w", err)
 	}
 	if info.Size() != totalSize {
+		a.discardUploadSession(sessionID, partialPath)
 		return nil, fmt.Errorf("partial file size does not match total_size")
 	}
 
@@ -593,10 +623,7 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		}
 	}
 	if expectedSHA != "" && computedSHA != "" && expectedSHA != computedSHA {
-		_ = os.Remove(partialPath)
-		a.FileTransferSessionsMu.Lock()
-		delete(a.FileTransferSessions, sessionID)
-		a.FileTransferSessionsMu.Unlock()
+		a.discardUploadSession(sessionID, partialPath)
 		return nil, fmt.Errorf(
 			"integrity check failed: expected sha256 %s but received %s",
 			expectedSHA, computedSHA,
@@ -604,14 +631,18 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	}
 
 	if err := enforceUploadConflictPolicySkip(destinationPath, conflictPolicy); err != nil {
-		_ = os.Remove(partialPath)
-		a.FileTransferSessionsMu.Lock()
-		delete(a.FileTransferSessions, sessionID)
-		a.FileTransferSessionsMu.Unlock()
+		a.discardUploadSession(sessionID, partialPath)
 		return nil, err
 	}
 
 	if err := replaceUploadPartialWithDestination(partialPath, destinationPath); err != nil {
+		if a.Logger != nil {
+			a.Logger.Warnf(
+				"file_transfer upload finalize session=%s: destination replace failed, "+
+					".partial retained at %s: %v",
+				sessionID, partialPath, err,
+			)
+		}
 		return nil, err
 	}
 
