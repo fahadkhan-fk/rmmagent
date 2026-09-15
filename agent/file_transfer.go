@@ -259,6 +259,7 @@ func replaceUploadPartialWithDestination(partialPath, destinationPath string) er
 	if err := os.Rename(partialPath, destinationPath); err != nil {
 		return fmt.Errorf("failed to rename partial file: %w", err)
 	}
+	invalidateFileBrowserListingsFor(destinationPath)
 	return nil
 }
 

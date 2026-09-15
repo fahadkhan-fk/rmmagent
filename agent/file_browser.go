@@ -250,6 +250,69 @@ func clearFileBrowserFilterSnapshotsForTest() {
 	fileBrowserFilterSnapshots = map[string]*fileBrowserFilterSnapshot{}
 }
 
+func fileBrowserSnapshotPathAffected(snapPath, root string) bool {
+	snapPath = filepath.Clean(snapPath)
+	root = filepath.Clean(root)
+	if snapPath == root {
+		return true
+	}
+	sep := string(os.PathSeparator)
+	prefix := root
+	if !strings.HasSuffix(prefix, sep) {
+		prefix += sep
+	}
+	return strings.HasPrefix(snapPath, prefix)
+}
+
+func invalidateFileBrowserListingsFor(paths ...string) {
+	seen := make(map[string]struct{}, len(paths)*2)
+	roots := make([]string, 0, len(paths)*2)
+	add := func(p string) {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			return
+		}
+		cleaned, err := validateUploadDestinationPath(p)
+		if err != nil {
+			cleaned = filepath.Clean(p)
+		}
+		if _, ok := seen[cleaned]; ok {
+			return
+		}
+		seen[cleaned] = struct{}{}
+		roots = append(roots, cleaned)
+	}
+	for _, p := range paths {
+		add(p)
+		cleaned, err := validateUploadDestinationPath(p)
+		if err != nil {
+			cleaned = filepath.Clean(strings.TrimSpace(p))
+		}
+		parent := filepath.Dir(cleaned)
+		if parent != "" && parent != "." && parent != cleaned {
+			add(parent)
+		}
+	}
+	if len(roots) == 0 {
+		return
+	}
+
+	fileBrowserFilterSnapshotsMu.Lock()
+	defer fileBrowserFilterSnapshotsMu.Unlock()
+	for key, snap := range fileBrowserFilterSnapshots {
+		if snap == nil {
+			delete(fileBrowserFilterSnapshots, key)
+			continue
+		}
+		for _, root := range roots {
+			if fileBrowserSnapshotPathAffected(snap.path, root) {
+				delete(fileBrowserFilterSnapshots, key)
+				break
+			}
+		}
+	}
+}
+
 func nameMatchesFileBrowserFilter(name, filter string) bool {
 	if filter == "" {
 		return true
@@ -797,6 +860,7 @@ func fileMkdir(rawParentPath, rawName string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("unable to create folder")
 	}
 
+	invalidateFileBrowserListingsFor(newPath)
 	return fileProperties(newPath, nil)
 }
 
@@ -860,6 +924,7 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("unable to rename path")
 	}
 
+	invalidateFileBrowserListingsFor(cleaned, newPath)
 	return fileProperties(newPath, nil)
 }
 
@@ -897,6 +962,7 @@ func fileDelete(rawPaths []string) (map[string]interface{}, error) {
 			continue
 		}
 
+		invalidateFileBrowserListingsFor(cleaned)
 		result["success"] = true
 		results = append(results, result)
 	}
