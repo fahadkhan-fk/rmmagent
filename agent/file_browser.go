@@ -24,6 +24,7 @@ const (
 	defaultFolderSummaryMaxFiles    = 100_000
 	defaultFolderSummaryMaxDepth    = 32
 	defaultFolderSummaryMaxDuration = 20 * time.Second
+	maxFolderSummaryDuration        = 60 * time.Second
 )
 
 type fileBrowserItem struct {
@@ -64,13 +65,13 @@ func parseFolderSummaryLimits(data map[string]string) folderSummaryLimits {
 		return limits
 	}
 	if v, err := strconv.Atoi(strings.TrimSpace(data["max_files"])); err == nil && v > 0 {
-		limits.maxFiles = v
+		limits.maxFiles = clampAtMostInt(v, defaultFolderSummaryMaxFiles)
 	}
 	if v, err := strconv.Atoi(strings.TrimSpace(data["max_depth"])); err == nil && v > 0 {
-		limits.maxDepth = v
+		limits.maxDepth = clampAtMostInt(v, defaultFolderSummaryMaxDepth)
 	}
 	if v, err := strconv.Atoi(strings.TrimSpace(data["max_duration_seconds"])); err == nil && v > 0 {
-		limits.maxDuration = time.Duration(v) * time.Second
+		limits.maxDuration = time.Duration(clampInt(v, 1, int(maxFolderSummaryDuration/time.Second))) * time.Second
 	}
 	return limits
 }

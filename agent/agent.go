@@ -1185,8 +1185,9 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	if err != nil {
 		return nil, err
 	}
-	if chunkSize <= 0 {
-		return nil, fmt.Errorf("chunk_size must be greater than 0")
+	chunkSize, err = clampChunkSize(chunkSize)
+	if err != nil {
+		return nil, err
 	}
 
 	filename, err := parsePayloadString(p.Data, "filename")

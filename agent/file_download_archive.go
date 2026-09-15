@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/shirou/gopsutil/v3/disk"
@@ -27,6 +29,71 @@ const (
 	archiveTempPrefix  = "trmm-archive-"
 	maxArchiveWarnings = 50
 )
+
+var (
+	errArchiveCanceled = errors.New("archive cancelled")
+
+	archiveBuildsMu sync.Mutex
+	archiveBuilds   = map[string]context.CancelFunc{}
+)
+
+func registerArchiveBuild(sessionID string) context.Context {
+	ctx, cancel := context.WithCancel(context.Background())
+	archiveBuildsMu.Lock()
+	if prev, ok := archiveBuilds[sessionID]; ok && prev != nil {
+		prev()
+	}
+	archiveBuilds[sessionID] = cancel
+	archiveBuildsMu.Unlock()
+	return ctx
+}
+
+func cancelArchiveBuild(sessionID string) bool {
+	archiveBuildsMu.Lock()
+	cancel, ok := archiveBuilds[sessionID]
+	archiveBuildsMu.Unlock()
+	if !ok || cancel == nil {
+		return false
+	}
+	cancel()
+	return true
+}
+
+func unregisterArchiveBuild(sessionID string) {
+	archiveBuildsMu.Lock()
+	delete(archiveBuilds, sessionID)
+	archiveBuildsMu.Unlock()
+}
+
+func archiveContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
+}
+
+func checkArchiveCanceled(ctx context.Context) error {
+	if archiveContext(ctx).Err() != nil {
+		return errArchiveCanceled
+	}
+	return nil
+}
+
+func archiveCanceledErr(err error) bool {
+	return err != nil && (errors.Is(err, errArchiveCanceled) || errors.Is(err, context.Canceled))
+}
+
+type cancelAwareReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r cancelAwareReader) Read(p []byte) (int, error) {
+	if err := checkArchiveCanceled(r.ctx); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
 
 func ensureArchiveDiskSpace(dir string, needed int64) error {
 	if needed <= 0 {
@@ -103,13 +170,13 @@ func parseArchiveLimits(data map[string]string) archiveLimits {
 		maxDepth:     defaultArchiveMaxDepth,
 	}
 	if v, err := parsePayloadInt64(data, "max_files"); err == nil && v > 0 {
-		limits.maxFiles = int(v)
+		limits.maxFiles = clampAtMostInt(int(v), defaultArchiveMaxFiles)
 	}
 	if v, err := parsePayloadInt64(data, "max_size_bytes"); err == nil && v > 0 {
-		limits.maxSizeBytes = v
+		limits.maxSizeBytes = clampAtMostInt64(v, defaultArchiveMaxSizeBytes)
 	}
 	if v, err := parsePayloadInt64(data, "max_depth"); err == nil && v > 0 {
-		limits.maxDepth = int(v)
+		limits.maxDepth = clampAtMostInt(int(v), defaultArchiveMaxDepth)
 	}
 	return limits
 }
@@ -203,14 +270,19 @@ func dedupeZipEntryName(name string, used map[string]struct{}) string {
 }
 
 func collectArchiveEntries(
+	ctx context.Context,
 	roots []string,
 	limits archiveLimits,
 ) (files []archiveFileEntry, dirNames []string, warnings []string, totalBytes int64, err error) {
 	usedNames := make(map[string]struct{})
 	fileCount := 0
 	depthTruncated := false
+	ctx = archiveContext(ctx)
 
 	for _, root := range roots {
+		if err := checkArchiveCanceled(ctx); err != nil {
+			return nil, nil, warnings, totalBytes, err
+		}
 		info, statErr := os.Lstat(root)
 		if statErr != nil {
 			return nil, nil, warnings, 0, fmt.Errorf("path not accessible: %s: %w", root, statErr)
@@ -229,6 +301,9 @@ func collectArchiveEntries(
 			dirNames = append(dirNames, rootZipPrefix+"/")
 
 			walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+				if err := checkArchiveCanceled(ctx); err != nil {
+					return err
+				}
 				if walkErr != nil {
 					warnings = append(warnings, fmt.Sprintf("skipped %s: %v", path, walkErr))
 					return nil
@@ -353,12 +428,20 @@ func appendArchiveWarning(warnings []string, msg string) []string {
 }
 
 func writeArchiveZip(
+	ctx context.Context,
 	tempPath string,
 	roots []string,
 	limits archiveLimits,
 ) (warnings []string, err error) {
-	files, dirNames, warnings, totalBytes, err := collectArchiveEntries(roots, limits)
+	ctx = archiveContext(ctx)
+	if err := checkArchiveCanceled(ctx); err != nil {
+		return nil, err
+	}
+	files, dirNames, warnings, totalBytes, err := collectArchiveEntries(ctx, roots, limits)
 	if err != nil {
+		return warnings, err
+	}
+	if err := checkArchiveCanceled(ctx); err != nil {
 		return warnings, err
 	}
 	if len(files) == 0 && len(dirNames) == 0 {
@@ -402,6 +485,9 @@ func writeArchiveZip(
 
 	addedFiles := 0
 	for _, entry := range files {
+		if err := checkArchiveCanceled(ctx); err != nil {
+			return warnings, err
+		}
 		info, err := entryInfoFromPath(entry.absPath, entry.size)
 		if err != nil {
 			warnings = appendArchiveWarning(
@@ -433,9 +519,12 @@ func writeArchiveZip(
 			return warnings, fmt.Errorf("failed to add %s: %w", entry.zipName, err)
 		}
 
-		_, copyErr := io.Copy(writer, src)
+		_, copyErr := io.Copy(writer, cancelAwareReader{ctx: ctx, r: src})
 		_ = src.Close()
 		if copyErr != nil {
+			if archiveCanceledErr(copyErr) {
+				return warnings, errArchiveCanceled
+			}
 			return warnings, fmt.Errorf("failed to write %s into archive: %w", entry.zipName, copyErr)
 		}
 		addedFiles++
@@ -499,13 +588,14 @@ func (a *Agent) PrepareFilesDownloadArchive(p *NatsMsg) (map[string]interface{},
 	if err != nil {
 		return nil, err
 	}
-	if chunkSize <= 0 {
-		return nil, fmt.Errorf("chunk_size must be greater than 0")
+	chunkSize, err = clampChunkSize(chunkSize)
+	if err != nil {
+		return nil, err
 	}
 
 	limits := parseArchiveLimits(p.Data)
-
-	go a.buildAndServeArchive(sessionID, paths, chunkSize, limits)
+	ctx := registerArchiveBuild(sessionID)
+	go a.buildAndServeArchive(ctx, sessionID, paths, chunkSize, limits)
 
 	return map[string]interface{}{"status": "building"}, nil
 }
@@ -513,8 +603,18 @@ func (a *Agent) PrepareFilesDownloadArchive(p *NatsMsg) (map[string]interface{},
 // buildAndServeArchive func builds the temp zip, reports readiness to the server and then
 // streams it through the normal download chunk relay.
 func (a *Agent) buildAndServeArchive(
-	sessionID string, paths []string, chunkSize int64, limits archiveLimits,
+	ctx context.Context, sessionID string, paths []string, chunkSize int64, limits archiveLimits,
 ) {
+	defer unregisterArchiveBuild(sessionID)
+	ctx = archiveContext(ctx)
+
+	if err := checkArchiveCanceled(ctx); err != nil {
+		if a.Logger != nil {
+			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+		}
+		return
+	}
+
 	tempPath, err := a.archiveTempPath(sessionID)
 	if err != nil {
 		a.Logger.Errorln("files_download_archive temp dir:", err)
@@ -538,11 +638,25 @@ func (a *Agent) buildAndServeArchive(
 
 	_ = os.Remove(tempPath)
 
-	warnings, err := writeArchiveZip(tempPath, paths, limits)
+	warnings, err := writeArchiveZip(ctx, tempPath, paths, limits)
 	if err != nil {
 		_ = os.Remove(tempPath)
+		if archiveCanceledErr(err) {
+			if a.Logger != nil {
+				a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			}
+			return
+		}
 		a.Logger.Errorln("files_download_archive build:", err)
 		a.reportArchiveError(sessionID, err.Error())
+		return
+	}
+
+	if err := checkArchiveCanceled(ctx); err != nil {
+		_ = os.Remove(tempPath)
+		if a.Logger != nil {
+			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+		}
 		return
 	}
 
@@ -554,9 +668,23 @@ func (a *Agent) buildAndServeArchive(
 	}
 	totalSize := info.Size()
 
-	if !a.reportArchiveReady(sessionID, tempPath, totalSize, warnings) {
+	if !a.reportArchiveReady(ctx, sessionID, tempPath, totalSize, warnings) {
 		_ = os.Remove(tempPath)
+		if checkArchiveCanceled(ctx) != nil {
+			if a.Logger != nil {
+				a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			}
+			return
+		}
 		a.reportArchiveError(sessionID, "failed to report archive ready after retries")
+		return
+	}
+
+	if err := checkArchiveCanceled(ctx); err != nil {
+		_ = os.Remove(tempPath)
+		if a.Logger != nil {
+			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+		}
 		return
 	}
 
@@ -590,7 +718,7 @@ func (a *Agent) buildAndServeArchive(
 }
 
 func (a *Agent) reportArchiveReady(
-	sessionID, archivePath string, totalSize int64, warnings []string,
+	ctx context.Context, sessionID, archivePath string, totalSize int64, warnings []string,
 ) bool {
 	url := fmt.Sprintf("/api/v3/file-transfers/%s/archive-ready/", sessionID)
 	payload := map[string]interface{}{
@@ -604,9 +732,15 @@ func (a *Agent) reportArchiveReady(
 	const maxAttempts = 4
 	backoff := 2 * time.Second
 	for attempt := 1; ; attempt++ {
-		ctx, cancel := context.WithTimeout(context.Background(), fileTransferFailTimeout)
-		resp, err := a.fileTransferHTTP().R().SetContext(ctx).SetBody(payload).Post(url)
+		if checkArchiveCanceled(ctx) != nil {
+			return false
+		}
+		reqCtx, cancel := context.WithTimeout(archiveContext(ctx), fileTransferFailTimeout)
+		resp, err := a.fileTransferHTTP().R().SetContext(reqCtx).SetBody(payload).Post(url)
 		cancel()
+		if checkArchiveCanceled(ctx) != nil {
+			return false
+		}
 		if err == nil && resp.StatusCode() == 200 {
 			return true
 		}
@@ -631,7 +765,13 @@ func (a *Agent) reportArchiveReady(
 			}
 			return false
 		}
-		time.Sleep(backoff)
+		timer := time.NewTimer(backoff)
+		select {
+		case <-archiveContext(ctx).Done():
+			timer.Stop()
+			return false
+		case <-timer.C:
+		}
 		backoff *= 2
 	}
 }

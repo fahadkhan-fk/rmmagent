@@ -36,11 +36,54 @@ const (
 	fileTransferDrainMinBackoff    = 50 * time.Millisecond
 	fileTransferDrainMaxBackoff    = 500 * time.Millisecond
 	fileTransferDrainIdleTimeout   = 15 * time.Second
+	fileTransferChunkSizeMin       = 1 * 1024 * 1024
+	fileTransferChunkSizeMax       = 16 * 1024 * 1024
 )
 
 var downloadChunkExpectedOffsetRe = regexp.MustCompile(
 	`does not match expected (\d+)`,
 )
+
+func clampInt(v, min, max int) int {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func clampInt64(v, min, max int64) int64 {
+	if v < min {
+		return min
+	}
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func clampAtMostInt(v, max int) int {
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func clampAtMostInt64(v, max int64) int64 {
+	if v > max {
+		return max
+	}
+	return v
+}
+
+func clampChunkSize(n int64) (int64, error) {
+	if n <= 0 {
+		return 0, fmt.Errorf("chunk_size must be greater than 0")
+	}
+	return clampInt64(n, fileTransferChunkSizeMin, fileTransferChunkSizeMax), nil
+}
 
 func (a *Agent) fileTransferHTTP() *resty.Client {
 	if a.fileTransferClient != nil {
@@ -852,8 +895,9 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 	if err != nil {
 		return nil, err
 	}
-	if chunkSize <= 0 {
-		return nil, fmt.Errorf("chunk_size must be greater than 0")
+	chunkSize, err = clampChunkSize(chunkSize)
+	if err != nil {
+		return nil, err
 	}
 
 	info, err := os.Stat(sourcePath)
@@ -1374,10 +1418,15 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		return nil, err
 	}
 
+	cancelledBuild := cancelArchiveBuild(sessionID)
+
 	a.DownloadTransferSessionsMu.Lock()
 	session, ok := a.DownloadTransferSessions[sessionID]
 	if !ok || session == nil {
 		a.DownloadTransferSessionsMu.Unlock()
+		if cancelledBuild && a.Logger != nil {
+			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+		}
 		return map[string]interface{}{"status": "completed"}, nil
 	}
 	stopStream := session.StopStream
