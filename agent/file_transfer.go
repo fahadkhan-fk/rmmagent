@@ -105,6 +105,8 @@ type UploadTransferSession struct {
 	LastActivity    time.Time
 	Hasher          hash.Hash
 	HashedOffset    int64
+	hashLive        bool
+	hashJob         *resumeHashJob
 	DormantSince    time.Time
 	Draining        bool
 }
@@ -550,7 +552,7 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 		return fmt.Errorf("chunk start offset changed during write")
 	}
 	session.CommittedOffset = committedOffset
-	if session.Hasher != nil && start == session.HashedOffset {
+	if session.hashLive && session.Hasher != nil && start == session.HashedOffset {
 		session.Hasher.Write(data)
 		session.HashedOffset = committedOffset
 	}
@@ -653,8 +655,14 @@ func (a *Agent) discardUploadSession(sessionID, partialPath string) {
 		}
 	}
 	a.FileTransferSessionsMu.Lock()
+	var job *resumeHashJob
+	if session, ok := a.FileTransferSessions[sessionID]; ok && session != nil {
+		job = session.hashJob
+		session.hashJob = nil
+	}
 	delete(a.FileTransferSessions, sessionID)
 	a.FileTransferSessionsMu.Unlock()
+	job.stop()
 }
 
 func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
@@ -690,6 +698,22 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	if destinationPath != session.DestinationPath {
 		a.FileTransferSessionsMu.Unlock()
 		return nil, fmt.Errorf("destination_path does not match session")
+	}
+	hashJob := session.hashJob
+	a.FileTransferSessionsMu.Unlock()
+
+	if err := waitResumeHashJob(hashJob); err != nil && a.Logger != nil {
+		a.Logger.Warnf(
+			"file_transfer upload finalize session=%s: resume prefix hash: %v",
+			sessionID, err,
+		)
+	}
+
+	a.FileTransferSessionsMu.Lock()
+	session, ok = a.FileTransferSessions[sessionID]
+	if !ok || session == nil {
+		a.FileTransferSessionsMu.Unlock()
+		return nil, fmt.Errorf("upload session not found")
 	}
 
 	partialPath := session.PartialPath
@@ -731,6 +755,11 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 	expectedSHA := strings.ToLower(strings.TrimSpace(p.Data["sha256"]))
 	computedSHA := ""
 	if hasher != nil && hashedOffset == totalSize {
+		computedSHA = hex.EncodeToString(hasher.Sum(nil))
+	} else if hasher != nil && hashedOffset >= 0 && hashedOffset < totalSize {
+		if err := hashFileRange(context.Background(), hasher, partialPath, hashedOffset, totalSize); err != nil {
+			return nil, fmt.Errorf("failed to hash partial file: %w", err)
+		}
 		computedSHA = hex.EncodeToString(hasher.Sum(nil))
 	} else if expectedSHA != "" {
 		computedSHA, err = hashFileSHA256(partialPath)
@@ -787,9 +816,13 @@ func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 	file := session.File
 	partialPath := session.PartialPath
+	hashJob := session.hashJob
+	session.hashJob = nil
 	session.File = nil
 	delete(a.FileTransferSessions, sessionID)
 	a.FileTransferSessionsMu.Unlock()
+
+	hashJob.stop()
 
 	if file != nil {
 		_ = file.Close()
@@ -818,6 +851,9 @@ type DownloadTransferSession struct {
 	LastActivity  time.Time
 	Hasher        hash.Hash
 	HashedOffset  int64
+	PushedOffset  int64
+	hashLive      bool
+	hashJob       *resumeHashJob
 	RemoveOnClose bool
 }
 
@@ -930,22 +966,26 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 	}
 
 	var hasher hash.Hash
-	if startOffset == 0 {
+	hashLive := startOffset == 0
+	if hashLive {
 		hasher = sha256.New()
 	}
 
 	stopStream := make(chan struct{})
 
 	a.DownloadTransferSessionsMu.Lock()
-	if existing, ok := a.DownloadTransferSessions[sessionID]; ok {
+	var oldHashJob *resumeHashJob
+	if existing, ok := a.DownloadTransferSessions[sessionID]; ok && existing != nil {
 		if existing.StopStream != nil {
 			close(existing.StopStream)
 		}
 		if existing.File != nil {
 			_ = existing.File.Close()
 		}
+		oldHashJob = existing.hashJob
+		existing.hashJob = nil
 	}
-	a.DownloadTransferSessions[sessionID] = &DownloadTransferSession{
+	session := &DownloadTransferSession{
 		SessionID:     sessionID,
 		SourcePath:    sourcePath,
 		TotalSize:     totalSize,
@@ -955,10 +995,26 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 		AckCh:         make(chan struct{}, 1),
 		LastActivity:  time.Now(),
 		Hasher:        hasher,
-		HashedOffset:  startOffset,
+		HashedOffset:  0,
+		PushedOffset:  startOffset,
+		hashLive:      hashLive,
 		RemoveOnClose: removeOnClose,
 	}
+	var resumeJob *resumeHashJob
+	var resumeCtx context.Context
+	if startOffset > 0 {
+		resumeJob, resumeCtx = newResumeHashJob()
+		session.hashJob = resumeJob
+		session.hashLive = false
+		session.Hasher = nil
+		session.HashedOffset = 0
+	}
+	a.DownloadTransferSessions[sessionID] = session
 	a.DownloadTransferSessionsMu.Unlock()
+	oldHashJob.stop()
+	if resumeJob != nil {
+		go a.runDownloadResumeHash(resumeCtx, resumeJob, sessionID, sourcePath, startOffset)
+	}
 
 	go a.streamDownloadChunks(sessionID, stopStream, startOffset)
 
@@ -1237,6 +1293,7 @@ func (a *Agent) failDownloadStream(sessionID string, cause error) {
 	a.DownloadTransferSessionsMu.Unlock()
 
 	if session != nil {
+		session.hashJob.stop()
 		if session.StopStream != nil {
 			select {
 			case <-session.StopStream:
@@ -1398,7 +1455,8 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 
 	a.DownloadTransferSessionsMu.Lock()
 	if s, ok := a.DownloadTransferSessions[sessionID]; ok && s != nil {
-		if s.Hasher != nil && offset == s.HashedOffset {
+		s.PushedOffset = offeredOffset
+		if s.hashLive && s.Hasher != nil && offset == s.HashedOffset {
 			s.Hasher.Write(buf[:n])
 			s.HashedOffset = offeredOffset
 		}
@@ -1429,6 +1487,25 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		}
 		return map[string]interface{}{"status": "completed"}, nil
 	}
+	hashJob := session.hashJob
+	a.DownloadTransferSessionsMu.Unlock()
+
+	if err := waitResumeHashJob(hashJob); err != nil && a.Logger != nil {
+		a.Logger.Warnf(
+			"file_transfer download finalize session=%s: resume prefix hash: %v",
+			sessionID, err,
+		)
+	}
+
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok = a.DownloadTransferSessions[sessionID]
+	if !ok || session == nil {
+		a.DownloadTransferSessionsMu.Unlock()
+		if cancelledBuild && a.Logger != nil {
+			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+		}
+		return map[string]interface{}{"status": "completed"}, nil
+	}
 	stopStream := session.StopStream
 	file := session.File
 	sourcePath := session.SourcePath
@@ -1436,12 +1513,22 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	hasher := session.Hasher
 	hashedOffset := session.HashedOffset
 	removeOnClose := session.RemoveOnClose
+	session.hashJob = nil
 	delete(a.DownloadTransferSessions, sessionID)
 	a.DownloadTransferSessionsMu.Unlock()
 
 	computedSHA := ""
 	if hasher != nil && hashedOffset == totalSize {
 		computedSHA = hex.EncodeToString(hasher.Sum(nil))
+	} else if hasher != nil && hashedOffset >= 0 && hashedOffset < totalSize && sourcePath != "" {
+		if herr := hashFileRange(context.Background(), hasher, sourcePath, hashedOffset, totalSize); herr == nil {
+			computedSHA = hex.EncodeToString(hasher.Sum(nil))
+		} else if a.Logger != nil {
+			a.Logger.Warnf(
+				"file_transfer download finalize session=%s: failed to hash remainder: %v",
+				sessionID, herr,
+			)
+		}
 	} else if sourcePath != "" {
 		if sha, herr := hashFileSHA256(sourcePath); herr == nil {
 			computedSHA = sha
@@ -1488,6 +1575,183 @@ func hashFileSHA256(path string) (string, error) {
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
+type resumeHashJob struct {
+	cancel context.CancelFunc
+	done   chan struct{}
+	err    error
+}
+
+func newResumeHashJob() (*resumeHashJob, context.Context) {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &resumeHashJob{cancel: cancel, done: make(chan struct{})}, ctx
+}
+
+func (j *resumeHashJob) stop() {
+	if j == nil {
+		return
+	}
+	j.cancel()
+	<-j.done
+}
+
+func waitResumeHashJob(j *resumeHashJob) error {
+	if j == nil {
+		return nil
+	}
+	<-j.done
+	return j.err
+}
+
+func hashFileRange(ctx context.Context, h hash.Hash, path string, start, end int64) error {
+	if h == nil {
+		return fmt.Errorf("hasher is nil")
+	}
+	if end < start {
+		return fmt.Errorf("invalid hash range")
+	}
+	if end == start {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+	buf := make([]byte, 1024*1024)
+	reader := io.LimitReader(f, end-start)
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		n, readErr := reader.Read(buf)
+		if n > 0 {
+			_, _ = h.Write(buf[:n])
+		}
+		if readErr == io.EOF {
+			return nil
+		}
+		if readErr != nil {
+			return readErr
+		}
+	}
+}
+
+func (a *Agent) runUploadResumeHash(
+	ctx context.Context, job *resumeHashJob, sessionID, path string, prefix int64,
+) {
+	defer close(job.done)
+	h := sha256.New()
+	if err := hashFileRange(ctx, h, path, 0, prefix); err != nil {
+		job.err = err
+		return
+	}
+	a.FileTransferSessionsMu.Lock()
+	session, ok := a.FileTransferSessions[sessionID]
+	if !ok || session == nil || session.hashJob != job {
+		a.FileTransferSessionsMu.Unlock()
+		return
+	}
+	session.Hasher = h
+	session.HashedOffset = prefix
+	a.FileTransferSessionsMu.Unlock()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			job.err = err
+			return
+		}
+		a.FileTransferSessionsMu.Lock()
+		session, ok = a.FileTransferSessions[sessionID]
+		if !ok || session == nil || session.hashJob != job {
+			a.FileTransferSessionsMu.Unlock()
+			return
+		}
+		from := session.HashedOffset
+		to := session.CommittedOffset
+		if from >= to {
+			session.hashLive = true
+			a.FileTransferSessionsMu.Unlock()
+			return
+		}
+		a.FileTransferSessionsMu.Unlock()
+		if err := hashFileRange(ctx, h, path, from, to); err != nil {
+			job.err = err
+			return
+		}
+		a.FileTransferSessionsMu.Lock()
+		session, ok = a.FileTransferSessions[sessionID]
+		if !ok || session == nil || session.hashJob != job {
+			a.FileTransferSessionsMu.Unlock()
+			return
+		}
+		if session.HashedOffset == from {
+			session.HashedOffset = to
+		}
+		a.FileTransferSessionsMu.Unlock()
+	}
+}
+
+func (a *Agent) runDownloadResumeHash(
+	ctx context.Context, job *resumeHashJob, sessionID, path string, prefix int64,
+) {
+	defer close(job.done)
+	h := sha256.New()
+	if err := hashFileRange(ctx, h, path, 0, prefix); err != nil {
+		job.err = err
+		return
+	}
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok := a.DownloadTransferSessions[sessionID]
+	if !ok || session == nil || session.hashJob != job {
+		a.DownloadTransferSessionsMu.Unlock()
+		return
+	}
+	session.Hasher = h
+	session.HashedOffset = prefix
+	a.DownloadTransferSessionsMu.Unlock()
+
+	for {
+		if err := ctx.Err(); err != nil {
+			job.err = err
+			return
+		}
+		a.DownloadTransferSessionsMu.Lock()
+		session, ok = a.DownloadTransferSessions[sessionID]
+		if !ok || session == nil || session.hashJob != job {
+			a.DownloadTransferSessionsMu.Unlock()
+			return
+		}
+		from := session.HashedOffset
+		to := session.PushedOffset
+		if from >= to {
+			session.hashLive = true
+			a.DownloadTransferSessionsMu.Unlock()
+			return
+		}
+		a.DownloadTransferSessionsMu.Unlock()
+		if err := hashFileRange(ctx, h, path, from, to); err != nil {
+			job.err = err
+			return
+		}
+		a.DownloadTransferSessionsMu.Lock()
+		session, ok = a.DownloadTransferSessions[sessionID]
+		if !ok || session == nil || session.hashJob != job {
+			a.DownloadTransferSessionsMu.Unlock()
+			return
+		}
+		if session.HashedOffset == from {
+			session.HashedOffset = to
+		}
+		a.DownloadTransferSessionsMu.Unlock()
+	}
+}
+
 func (a *Agent) ReapStaleFileTransferSessions() {
 	now := time.Now()
 
@@ -1529,6 +1793,7 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 		)
 	}
 	for _, session := range toRemove {
+		session.hashJob.stop()
 		if session.PartialPath != "" {
 			if err := os.Remove(session.PartialPath); err != nil && !os.IsNotExist(err) {
 				a.Logger.Warnf(
@@ -1559,6 +1824,7 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 	a.DownloadTransferSessionsMu.Unlock()
 
 	for _, session := range staleDownloads {
+		session.hashJob.stop()
 		if session.StopStream != nil {
 			close(session.StopStream)
 		}

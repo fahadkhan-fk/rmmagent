@@ -1222,19 +1222,25 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 
 	var hasher hash.Hash
-	if !resume {
+	hashLive := true
+	hashedOffset := committedOffset
+	if !resume || committedOffset == 0 {
 		hasher = sha256.New()
+		hashedOffset = 0
+		hashLive = true
 	}
 
 	a.FileTransferSessionsMu.Lock()
-
-	if existing, ok := a.FileTransferSessions[sessionID]; ok {
+	var oldHashJob *resumeHashJob
+	if existing, ok := a.FileTransferSessions[sessionID]; ok && existing != nil {
 		if existing.File != nil {
 			_ = existing.File.Close()
 		}
+		oldHashJob = existing.hashJob
+		existing.hashJob = nil
 	}
 
-	a.FileTransferSessions[sessionID] = &UploadTransferSession{
+	session := &UploadTransferSession{
 		SessionID:       sessionID,
 		DestinationPath: destinationPath,
 		PartialPath:     partialPath,
@@ -1246,9 +1252,25 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		File:            file,
 		LastActivity:    time.Now(),
 		Hasher:          hasher,
-		HashedOffset:    committedOffset,
+		HashedOffset:    hashedOffset,
+		hashLive:        hashLive,
 	}
+
+	var resumeJob *resumeHashJob
+	var resumeCtx context.Context
+	if resume && committedOffset > 0 {
+		resumeJob, resumeCtx = newResumeHashJob()
+		session.hashJob = resumeJob
+		session.hashLive = false
+		session.Hasher = nil
+		session.HashedOffset = 0
+	}
+	a.FileTransferSessions[sessionID] = session
 	a.FileTransferSessionsMu.Unlock()
+	oldHashJob.stop()
+	if resumeJob != nil {
+		go a.runUploadResumeHash(resumeCtx, resumeJob, sessionID, partialPath, committedOffset)
+	}
 
 	return map[string]interface{}{
 		"status":           "ready",
