@@ -960,7 +960,7 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 	removeOnClose := strings.EqualFold(strings.TrimSpace(p.Data["remove_on_close"]), "true") &&
 		a.isArchiveTempPath(sourcePath)
 
-	file, err := os.Open(sourcePath)
+	file, err := openExistingFileSharedRead(sourcePath)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open source file: %w", err)
 	}
@@ -1562,7 +1562,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 }
 
 func hashFileSHA256(path string) (string, error) {
-	f, err := os.Open(path)
+	f, err := openExistingFileSharedRead(path)
 	if err != nil {
 		return "", err
 	}
@@ -1615,7 +1615,7 @@ func hashFileRange(ctx context.Context, h hash.Hash, path string, start, end int
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	f, err := os.Open(path)
+	f, err := openExistingFileSharedRead(path)
 	if err != nil {
 		return err
 	}

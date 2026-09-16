@@ -200,3 +200,24 @@ func openFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error)
 	}
 	return os.NewFile(uintptr(h), path), nil
 }
+
+func openExistingFileSharedRead(path string) (*os.File, error) {
+	pathPtr, err := windows.UTF16PtrFromString(path)
+	if err != nil {
+		return nil, err
+	}
+
+	h, err := windows.CreateFile(
+		pathPtr,
+		windows.GENERIC_READ,
+		uint32(windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE|windows.FILE_SHARE_DELETE),
+		nil,
+		windows.OPEN_EXISTING,
+		windows.FILE_ATTRIBUTE_NORMAL,
+		0,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(h), path), nil
+}

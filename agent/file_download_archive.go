@@ -496,7 +496,7 @@ func writeArchiveZip(
 			continue
 		}
 
-		src, err := os.Open(entry.absPath)
+		src, err := openExistingFileSharedRead(entry.absPath)
 		if err != nil {
 			warnings = appendArchiveWarning(
 				warnings, fmt.Sprintf("skipped %s: %v", entry.absPath, err),
@@ -688,7 +688,7 @@ func (a *Agent) buildAndServeArchive(
 		return
 	}
 
-	file, err := os.Open(tempPath)
+	file, err := openExistingFileSharedRead(tempPath)
 	if err != nil {
 		_ = os.Remove(tempPath)
 		a.reportArchiveError(sessionID, fmt.Sprintf("failed to open archive: %v", err))

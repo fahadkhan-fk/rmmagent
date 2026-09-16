@@ -1082,3 +1082,7 @@ func openFileNoFollow(path string, flag int, perm os.FileMode) (*os.File, error)
 	}
 	return os.NewFile(uintptr(fd), path), nil
 }
+
+func openExistingFileSharedRead(path string) (*os.File, error) {
+	return os.Open(path)
+}
