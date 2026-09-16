@@ -1021,6 +1021,10 @@ func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string)
 	return nil, errors.New("directory listing is only supported on Windows")
 }
 
+func FileExistsWindows(rawDir string, names []string) (map[string]interface{}, error) {
+	return nil, errors.New("file exists is only supported on Windows")
+}
+
 func FilePropertiesWindows(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {
 	return nil, errors.New("file properties is only supported on Windows")
 }

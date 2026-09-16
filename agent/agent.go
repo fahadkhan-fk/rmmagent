@@ -1282,6 +1282,10 @@ func (a *Agent) ListDirectory(rawPath string, page, pageSize int, nameFilter str
 	return listDirectory(rawPath, page, pageSize, nameFilter)
 }
 
+func (a *Agent) FileExists(rawDir string, names []string) (map[string]interface{}, error) {
+	return fileExistsNames(rawDir, names)
+}
+
 func (a *Agent) FileProperties(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {
 	return fileProperties(rawPath, &limits)
 }

@@ -961,6 +961,36 @@ func (a *Agent) RunRPC() {
 				msg.Respond(resp)
 			}(payload)
 
+		case "files_exists":
+			go func(p *NatsMsg) {
+				defer a.recoverFilesRPC("files_exists", msg)
+				var resp []byte
+				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
+				names, err := parsePayloadNamesJSON(p.Data)
+				if err != nil {
+					a.Logger.Errorln("files_exists:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+
+				var result map[string]interface{}
+				switch runtime.GOOS {
+				case "windows":
+					result, err = FileExistsWindows(strings.TrimSpace(p.Data["path"]), names)
+				default:
+					result, err = a.FileExists(strings.TrimSpace(p.Data["path"]), names)
+				}
+				if err != nil {
+					a.Logger.Errorln("files_exists:", err)
+					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
+					msg.Respond(resp)
+					return
+				}
+				_ = ret.Encode(result)
+				msg.Respond(resp)
+			}(payload)
+
 		case "files_properties":
 			go func(p *NatsMsg) {
 				defer a.recoverFilesRPC("files_properties", msg)

@@ -21,6 +21,7 @@ const (
 	fileBrowserFilterSnapshotTTL    = 60 * time.Second
 	fileBrowserFilterSnapshotMax    = 32
 	fileBrowserFilterMaxLen         = 255
+	fileBrowserMaxExistsNames       = 500
 	defaultFolderSummaryMaxFiles    = 100_000
 	defaultFolderSummaryMaxDepth    = 32
 	defaultFolderSummaryMaxDuration = 20 * time.Second
@@ -74,6 +75,82 @@ func parseFolderSummaryLimits(data map[string]string) folderSummaryLimits {
 		limits.maxDuration = time.Duration(clampInt(v, 1, int(maxFolderSummaryDuration/time.Second))) * time.Second
 	}
 	return limits
+}
+
+func parsePayloadNamesJSON(data map[string]string) ([]string, error) {
+	raw, err := parsePayloadString(data, "names_json")
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	if err := json.Unmarshal([]byte(raw), &names); err != nil {
+		return nil, fmt.Errorf("invalid names_json")
+	}
+	if len(names) == 0 {
+		return nil, fmt.Errorf("names_json must contain at least one name")
+	}
+	cleaned := make([]string, 0, len(names))
+	seen := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if err := validateFileBrowserName(name); err != nil {
+			return nil, fmt.Errorf("invalid name %q", name)
+		}
+		key := name
+		if runtime.GOOS == "windows" {
+			key = strings.ToLower(name)
+		}
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		cleaned = append(cleaned, name)
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("names_json must contain at least one valid name")
+	}
+	if len(cleaned) > fileBrowserMaxExistsNames {
+		return nil, fmt.Errorf("too many names (max %d)", fileBrowserMaxExistsNames)
+	}
+	return cleaned, nil
+}
+
+func fileExistsNames(rawDir string, names []string) (map[string]interface{}, error) {
+	dir, err := validateUploadDestinationPath(rawDir)
+	if err != nil {
+		return nil, fmt.Errorf("invalid path")
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("path not found")
+		}
+		if os.IsPermission(err) {
+			return nil, fmt.Errorf("permission denied")
+		}
+		return nil, fmt.Errorf("unable to access path")
+	}
+	if !info.IsDir() {
+		return nil, fmt.Errorf("path is not a directory")
+	}
+
+	existing := make([]string, 0)
+	for _, name := range names {
+		candidate := filepath.Join(dir, name)
+		if _, statErr := os.Lstat(candidate); statErr == nil {
+			existing = append(existing, name)
+			continue
+		} else if !os.IsNotExist(statErr) {
+			if os.IsPermission(statErr) {
+				return nil, fmt.Errorf("permission denied")
+			}
+			return nil, fmt.Errorf("unable to access path")
+		}
+	}
+	return map[string]interface{}{"existing": existing}, nil
 }
 
 func summarizeFolder(root string, limits folderSummaryLimits) folderSummary {

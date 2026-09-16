@@ -17,6 +17,10 @@ func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string)
 	return listDirectory(rawPath, page, pageSize, nameFilter)
 }
 
+func FileExistsWindows(rawDir string, names []string) (map[string]interface{}, error) {
+	return fileExistsNames(rawDir, names)
+}
+
 func FilePropertiesWindows(rawPath string, limits folderSummaryLimits) (map[string]interface{}, error) {
 	return fileProperties(rawPath, &limits)
 }
