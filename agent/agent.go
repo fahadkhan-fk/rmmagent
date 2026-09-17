@@ -1211,6 +1211,9 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	if err := enforceUploadConflictPolicySkip(destinationPath, conflictPolicy); err != nil {
 		return nil, err
 	}
+	if err := rejectUploadDestinationIfDirectory(destinationPath); err != nil {
+		return nil, err
+	}
 
 	resume, resumeOffset := parsePayloadResume(p.Data)
 	partialPath := destinationPath + ".partial"

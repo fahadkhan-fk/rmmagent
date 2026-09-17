@@ -293,22 +293,80 @@ func prepareUploadPartialFile(
 }
 
 func replaceUploadPartialWithDestination(partialPath, destinationPath string) error {
-	if _, err := os.Lstat(destinationPath); err == nil {
-		if err := os.Remove(destinationPath); err != nil {
-			return fmt.Errorf("failed to remove existing destination file: %w", err)
-		}
-	} else if !os.IsNotExist(err) {
+	if err := rejectUploadDestinationIfDirectory(destinationPath); err != nil {
+		return err
+	}
+
+	_, err := os.Lstat(destinationPath)
+	if err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("failed to check destination file: %w", err)
 	}
 
+	if os.IsNotExist(err) {
+		if err := os.Rename(partialPath, destinationPath); err != nil {
+			return fmt.Errorf("failed to rename partial file: %w", err)
+		}
+		invalidateFileBrowserListingsFor(destinationPath)
+		return nil
+	}
+
+	clearPathReadOnlyIfNeeded(destinationPath)
+	backupPath, err := nextReplaceBackupPath(destinationPath)
+	if err != nil {
+		return err
+	}
+	if err := os.Rename(destinationPath, backupPath); err != nil {
+		return fmt.Errorf("failed to move existing destination file: %w", err)
+	}
 	if err := os.Rename(partialPath, destinationPath); err != nil {
+		if restoreErr := os.Rename(backupPath, destinationPath); restoreErr != nil {
+			return fmt.Errorf(
+				"failed to rename partial file: %v; original kept at %s: %v",
+				err, backupPath, restoreErr,
+			)
+		}
 		return fmt.Errorf("failed to rename partial file: %w", err)
 	}
+	_ = os.Remove(backupPath)
 	invalidateFileBrowserListingsFor(destinationPath)
 	return nil
 }
 
+func rejectUploadDestinationIfDirectory(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf("failed to check destination file: %w", err)
+	}
+	if info.IsDir() {
+		return fmt.Errorf("destination is a directory")
+	}
+	return nil
+}
+
+func nextReplaceBackupPath(dest string) (string, error) {
+	for i := 0; i < 100; i++ {
+		candidate := dest + ".trmm-replace"
+		if i > 0 {
+			candidate = fmt.Sprintf("%s.trmm-replace-%d", dest, i)
+		}
+		_, err := os.Lstat(candidate)
+		if os.IsNotExist(err) {
+			return candidate, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to allocate replace backup path: %w", err)
+		}
+	}
+	return "", fmt.Errorf("failed to allocate replace backup path")
+}
+
 func validateUploadFilename(filename string) error {
+	if strings.HasSuffix(filename, " ") || strings.HasSuffix(filename, ".") {
+		return fmt.Errorf("filename cannot end with a space or a period")
+	}
 	if filename == "." || filename == ".." {
 		return fmt.Errorf("invalid filename")
 	}

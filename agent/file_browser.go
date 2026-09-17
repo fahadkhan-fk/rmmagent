@@ -505,8 +505,10 @@ func buildFileBrowserItem(dirPath, name string, info os.FileInfo) fileBrowserIte
 	hidden, system, readOnly := fileAttributeFlags(fullPath, info, name)
 
 	size := "0"
+	extension := ""
 	if itemType == "file" {
 		size = strconv.FormatInt(info.Size(), 10)
+		extension = extensionFromName(name)
 	}
 
 	return fileBrowserItem{
@@ -514,7 +516,7 @@ func buildFileBrowserItem(dirPath, name string, info os.FileInfo) fileBrowserIte
 		Name:      name,
 		Path:      fullPath,
 		Type:      itemType,
-		Extension: extensionFromName(name),
+		Extension: extension,
 		Size:      size,
 		Modified:  modified,
 		Created:   created,
@@ -958,7 +960,8 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 		return nil, fmt.Errorf("new name must differ")
 	}
 
-	if _, err := os.Lstat(cleaned); err != nil {
+	oldInfo, err := os.Lstat(cleaned)
+	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, fmt.Errorf("path not found")
 		}
@@ -970,14 +973,16 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 
 	newPath := filepath.Join(filepath.Dir(cleaned), newName)
 	if existing, err := os.Lstat(newPath); err == nil {
-		if existing.IsDir() {
+		if !os.SameFile(oldInfo, existing) {
+			if existing.IsDir() {
+				return nil, fmt.Errorf(
+					"This destination already contains a folder named %q", newName,
+				)
+			}
 			return nil, fmt.Errorf(
-				"This destination already contains a folder named %q", newName,
+				"This destination already contains a file named %q", newName,
 			)
 		}
-		return nil, fmt.Errorf(
-			"This destination already contains a file named %q", newName,
-		)
 	} else if !os.IsNotExist(err) {
 		if os.IsPermission(err) {
 			return nil, fmt.Errorf("permission denied")
