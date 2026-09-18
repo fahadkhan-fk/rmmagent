@@ -13,8 +13,8 @@ import (
 	"github.com/shirou/gopsutil/v3/disk"
 )
 
-func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
-	return listDirectory(rawPath, page, pageSize, nameFilter)
+func ListDirectoryWindows(a *Agent, rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
+	return listDirectory(a, rawPath, page, pageSize, nameFilter)
 }
 
 func FileExistsWindows(rawDir string, names []string) (map[string]interface{}, error) {

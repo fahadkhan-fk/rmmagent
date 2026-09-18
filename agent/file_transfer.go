@@ -3,11 +3,13 @@ package agent
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"hash"
 	"io"
+	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -19,25 +21,29 @@ import (
 )
 
 const (
-	downloadPutTimeout             = 120 * time.Second
-	downloadReadyGetTimeout        = 15 * time.Second
-	uploadChunkGetTimeout          = 120 * time.Second
-	uploadChunkAckTimeout          = 60 * time.Second
-	fileTransferFailTimeout        = 30 * time.Second
-	downloadPushMaxAttempts        = 12
-	downloadPushRetryMinBackoff    = 500 * time.Millisecond
-	downloadPushRetryMaxBackoff    = 8 * time.Second
-	downloadPushAckFallbackPoll    = 5 * time.Second
-	downloadPushAckWaitMax         = 120 * time.Second
-	downloadPushAckWaitLogEvery    = 5 * time.Second
-	fileTransferSessionIdleTimeout = 10 * time.Minute
-	fileTransferReaperInterval     = 2 * time.Minute
-	fileTransferPartialRetention   = 1 * time.Hour
-	fileTransferDrainMinBackoff    = 50 * time.Millisecond
-	fileTransferDrainMaxBackoff    = 500 * time.Millisecond
-	fileTransferDrainIdleTimeout   = 15 * time.Second
-	fileTransferChunkSizeMin       = 1 * 1024 * 1024
-	fileTransferChunkSizeMax       = 16 * 1024 * 1024
+	downloadPutTimeout              = 120 * time.Second
+	downloadReadyGetTimeout         = 15 * time.Second
+	uploadChunkGetTimeout           = 120 * time.Second
+	uploadChunkAckTimeout           = 60 * time.Second
+	fileTransferFailTimeout         = 30 * time.Second
+	downloadPushMaxAttempts         = 12
+	downloadPushRetryMinBackoff     = 500 * time.Millisecond
+	downloadPushRetryMaxBackoff     = 8 * time.Second
+	downloadPushAckFallbackPoll     = 5 * time.Second
+	downloadPushAckWaitMax          = 120 * time.Second
+	downloadPushAckWaitLogEvery     = 5 * time.Second
+	fileTransferSessionIdleTimeout  = 10 * time.Minute
+	fileTransferReaperInterval      = 2 * time.Minute
+	fileTransferPartialRetention    = 1 * time.Hour
+	fileTransferDrainMinBackoff     = 50 * time.Millisecond
+	fileTransferDrainMaxBackoff     = 500 * time.Millisecond
+	fileTransferDrainIdleTimeout    = 15 * time.Second
+	fileTransferChunkSizeMin        = 1 * 1024 * 1024
+	fileTransferChunkSizeMax        = 16 * 1024 * 1024
+	fileTransferIdleConnTimeout     = 3 * time.Minute
+	fileTransferTLSHandshakeTimeout = 15 * time.Second
+	fileTransferMaxIdleConns        = 32
+	fileTransferMaxIdleConnsPerHost = 8
 )
 
 var downloadChunkExpectedOffsetRe = regexp.MustCompile(
@@ -83,6 +89,54 @@ func clampChunkSize(n int64) (int64, error) {
 		return 0, fmt.Errorf("chunk_size must be greater than 0")
 	}
 	return clampInt64(n, fileTransferChunkSizeMin, fileTransferChunkSizeMax), nil
+}
+
+func newFileTransferResty(
+	baseURL string,
+	headers map[string]string,
+	debug bool,
+	insecure bool,
+	proxy string,
+	rootCert string,
+) *resty.Client {
+	c := resty.New()
+	c.SetBaseURL(baseURL)
+	if len(headers) > 0 {
+		c.SetHeaders(headers)
+	}
+	c.SetTimeout(0)
+	c.SetDebug(debug)
+	if insecure {
+		c.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
+	}
+	if proxy != "" {
+		c.SetProxy(proxy)
+	}
+	if rootCert != "" {
+		c.SetRootCertificate(rootCert)
+	}
+	enableFileTransferKeepAlive(c)
+	return c
+}
+
+func enableFileTransferKeepAlive(c *resty.Client) {
+	if c == nil {
+		return
+	}
+	httpClient := c.GetClient()
+	if httpClient == nil {
+		return
+	}
+	tr, ok := httpClient.Transport.(*http.Transport)
+	if !ok || tr == nil {
+		tr = http.DefaultTransport.(*http.Transport).Clone()
+		httpClient.Transport = tr
+	}
+	tr.DisableKeepAlives = false
+	tr.MaxIdleConns = fileTransferMaxIdleConns
+	tr.MaxIdleConnsPerHost = fileTransferMaxIdleConnsPerHost
+	tr.IdleConnTimeout = fileTransferIdleConnTimeout
+	tr.TLSHandshakeTimeout = fileTransferTLSHandshakeTimeout
 }
 
 func (a *Agent) fileTransferHTTP() *resty.Client {

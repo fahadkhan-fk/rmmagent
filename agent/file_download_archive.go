@@ -147,7 +147,7 @@ func parsePayloadPathsJSON(data map[string]string) ([]string, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid path %q: %w", p, err)
 		}
-		key := strings.ToLower(validated)
+		key := fsIdentityKey(validated)
 		if _, ok := seen[key]; ok {
 			continue
 		}

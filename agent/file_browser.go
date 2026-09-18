@@ -77,6 +77,17 @@ func parseFolderSummaryLimits(data map[string]string) folderSummaryLimits {
 	return limits
 }
 
+func fsIdentityKey(s string) string {
+	return fsIdentityKeyFor(s, runtime.GOOS)
+}
+
+func fsIdentityKeyFor(s, goos string) string {
+	if goos == "windows" {
+		return strings.ToLower(s)
+	}
+	return s
+}
+
 func parsePayloadNamesJSON(data map[string]string) ([]string, error) {
 	raw, err := parsePayloadString(data, "names_json")
 	if err != nil {
@@ -99,10 +110,7 @@ func parsePayloadNamesJSON(data map[string]string) ([]string, error) {
 		if err := validateFileBrowserName(name); err != nil {
 			return nil, fmt.Errorf("invalid name %q", name)
 		}
-		key := name
-		if runtime.GOOS == "windows" {
-			key = strings.ToLower(name)
-		}
+		key := fsIdentityKey(name)
 		if _, ok := seen[key]; ok {
 			continue
 		}
@@ -438,6 +446,45 @@ func paginateFileBrowserItems(items []fileBrowserItem, page, pageSize int) (enco
 	return encoded, total, hasMore
 }
 
+func uploadPartialNameKeysIn(a *Agent, dir string) map[string]struct{} {
+	if a == nil {
+		return nil
+	}
+	dirKey := fsIdentityKey(filepath.Clean(dir))
+	a.FileTransferSessionsMu.Lock()
+	defer a.FileTransferSessionsMu.Unlock()
+	var hidden map[string]struct{}
+	for _, session := range a.FileTransferSessions {
+		if session == nil || strings.TrimSpace(session.PartialPath) == "" {
+			continue
+		}
+		partial := filepath.Clean(session.PartialPath)
+		if fsIdentityKey(filepath.Dir(partial)) != dirKey {
+			continue
+		}
+		if hidden == nil {
+			hidden = make(map[string]struct{})
+		}
+		hidden[fsIdentityKey(filepath.Base(partial))] = struct{}{}
+	}
+	return hidden
+}
+
+func excludeUploadPartialItems(a *Agent, dir string, items []fileBrowserItem) []fileBrowserItem {
+	hidden := uploadPartialNameKeysIn(a, dir)
+	if len(hidden) == 0 {
+		return items
+	}
+	out := make([]fileBrowserItem, 0, len(items))
+	for _, item := range items {
+		if _, ok := hidden[fsIdentityKey(item.Name)]; ok {
+			continue
+		}
+		out = append(out, item)
+	}
+	return out
+}
+
 func buildDirectoryItems(cleaned string) ([]fileBrowserItem, error) {
 	entries, err := os.ReadDir(cleaned)
 	if err != nil {
@@ -451,9 +498,6 @@ func buildDirectoryItems(cleaned string) ([]fileBrowserItem, error) {
 	for _, entry := range entries {
 		name := entry.Name()
 		if name == "." || name == ".." {
-			continue
-		}
-		if strings.HasSuffix(name, ".partial") {
 			continue
 		}
 
@@ -575,7 +619,7 @@ func normalizeFileBrowserPage(page, pageSize int) (int, int) {
 	return page, pageSize
 }
 
-func listDirectory(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
+func listDirectory(a *Agent, rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
 	path := strings.TrimSpace(rawPath)
 	if path == "" {
 		resolved, resolveErr := resolveDefaultFileBrowserPath()
@@ -648,6 +692,7 @@ func listDirectory(rawPath string, page, pageSize int, nameFilter string) (map[s
 		}
 	}
 
+	items = excludeUploadPartialItems(a, cleaned, items)
 	encoded, total, hasMore := paginateFileBrowserItems(items, page, pageSize)
 
 	return map[string]interface{}{
@@ -687,10 +732,7 @@ func firstReadableDirectory(candidates []string) string {
 		if cleaned == "" {
 			continue
 		}
-		key := cleaned
-		if runtime.GOOS == "windows" {
-			key = strings.ToLower(cleaned)
-		}
+		key := fsIdentityKey(cleaned)
 		if _, ok := seen[key]; ok {
 			continue
 		}

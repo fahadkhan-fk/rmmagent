@@ -946,7 +946,7 @@ func (a *Agent) RunRPC() {
 				var err error
 				switch runtime.GOOS {
 				case "windows":
-					result, err = ListDirectoryWindows(path, page, pageSize, nameFilter)
+					result, err = ListDirectoryWindows(a, path, page, pageSize, nameFilter)
 				default:
 					result, err = a.ListDirectory(path, page, pageSize, nameFilter)
 				}

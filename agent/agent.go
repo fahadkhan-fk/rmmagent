@@ -206,21 +206,14 @@ func New(logger *logrus.Logger, version string) *Agent {
 		restyC.SetRootCertificate(ac.Cert)
 	}
 
-	ftClient := resty.New()
-	ftClient.SetBaseURL(ac.BaseURL)
-	ftClient.SetCloseConnection(true)
-	ftClient.SetHeaders(headers)
-	ftClient.SetTimeout(0)
-	ftClient.SetDebug(logger.IsLevelEnabled(logrus.DebugLevel))
-	if insecure {
-		ftClient.SetTLSClientConfig(&tls.Config{InsecureSkipVerify: true})
-	}
-	if len(ac.Proxy) > 0 {
-		ftClient.SetProxy(ac.Proxy)
-	}
-	if len(ac.Cert) > 0 {
-		ftClient.SetRootCertificate(ac.Cert)
-	}
+	ftClient := newFileTransferResty(
+		ac.BaseURL,
+		headers,
+		logger.IsLevelEnabled(logrus.DebugLevel),
+		insecure,
+		ac.Proxy,
+		ac.Cert,
+	)
 
 	if len(ac.WinTmpDir) > 0 {
 		winTempDir = ac.WinTmpDir
@@ -1282,7 +1275,7 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 }
 
 func (a *Agent) ListDirectory(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
-	return listDirectory(rawPath, page, pageSize, nameFilter)
+	return listDirectory(a, rawPath, page, pageSize, nameFilter)
 }
 
 func (a *Agent) FileExists(rawDir string, names []string) (map[string]interface{}, error) {

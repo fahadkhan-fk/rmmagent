@@ -1017,7 +1017,7 @@ func FeedTerminalInputWindows(sessionID string, input string) error {
 	return errors.New("failed to feed input terminal session on windows")
 }
 
-func ListDirectoryWindows(rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
+func ListDirectoryWindows(a *Agent, rawPath string, page, pageSize int, nameFilter string) (map[string]interface{}, error) {
 	return nil, errors.New("directory listing is only supported on Windows")
 }
 
