@@ -829,17 +829,135 @@ func validateFileBrowserName(name string) error {
 	return nil
 }
 
-func isProtectedDeletePath(cleaned string) bool {
-	vol := filepath.VolumeName(cleaned)
-	if vol != "" {
-		rest := strings.TrimPrefix(cleaned, vol)
-		rest = strings.Trim(strings.TrimPrefix(rest, `\`), `/`)
-		if rest == "" {
+func deletePathKey(s, goos string) string {
+	s = strings.TrimSpace(s)
+	if goos == "windows" {
+		s = strings.ReplaceAll(s, "/", `\`)
+		s = strings.ToLower(s)
+		return strings.TrimRight(s, `\`)
+	}
+	if s != "/" {
+		s = strings.TrimRight(s, "/")
+	}
+	return s
+}
+
+func sameDeletePath(a, b, goos string) bool {
+	if a == "" || b == "" {
+		return false
+	}
+	return deletePathKey(a, goos) == deletePathKey(b, goos)
+}
+
+func isVolumeRootDeletePath(cleaned, goos string) bool {
+	key := deletePathKey(cleaned, goos)
+	if key == "" {
+		return false
+	}
+	if goos == "windows" {
+		return len(key) == 2 && key[0] >= 'a' && key[0] <= 'z' && key[1] == ':'
+	}
+	return key == "/"
+}
+
+func isStrictDeleteAncestor(parent, child, goos string) bool {
+	p := deletePathKey(parent, goos)
+	c := deletePathKey(child, goos)
+	if p == "" || c == "" || p == c {
+		return false
+	}
+	if goos == "windows" {
+		if isVolumeRootDeletePath(parent, goos) {
+			return strings.HasPrefix(c, p+`\`)
+		}
+		return strings.HasPrefix(c, p+`\`)
+	}
+	if p == "/" {
+		return c != "/"
+	}
+	return strings.HasPrefix(c, p+"/")
+}
+
+func wellKnownSystemDeletePaths(goos string) []string {
+	if goos == "windows" {
+		paths := []string{
+			`C:\Windows`,
+			`C:\Windows\System32`,
+			`C:\Windows\SysWOW64`,
+			`C:\Program Files`,
+			`C:\Program Files (x86)`,
+			`C:\ProgramData`,
+			`C:\Users`,
+		}
+		if runtime.GOOS == "windows" {
+			if v := strings.TrimSpace(os.Getenv("SystemRoot")); v != "" {
+				paths = append(paths, v, filepath.Join(v, "System32"), filepath.Join(v, "SysWOW64"))
+			}
+			if v := strings.TrimSpace(os.Getenv("ProgramFiles")); v != "" {
+				paths = append(paths, v)
+			}
+			if v := strings.TrimSpace(os.Getenv("ProgramFiles(x86)")); v != "" {
+				paths = append(paths, v)
+			}
+			if v := strings.TrimSpace(os.Getenv("ProgramData")); v != "" {
+				paths = append(paths, v)
+			}
+			if v := strings.TrimSpace(os.Getenv("SystemDrive")); v != "" {
+				drive := strings.TrimRight(v, `/\`)
+				if len(drive) == 2 && drive[1] == ':' {
+					paths = append(paths,
+						filepath.Join(drive+`\`, "Windows"),
+						filepath.Join(drive+`\`, "Program Files"),
+						filepath.Join(drive+`\`, "Program Files (x86)"),
+						filepath.Join(drive+`\`, "ProgramData"),
+						filepath.Join(drive+`\`, "Users"),
+					)
+				}
+			}
+		}
+		return paths
+	}
+
+	paths := []string{
+		"/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
+		"/lib", "/lib64", "/etc", "/boot", "/dev", "/proc", "/sys", "/run",
+		"/root", "/home", "/opt", "/var", "/usr/local", "/Users",
+	}
+	if goos == "darwin" {
+		paths = append(paths, "/System", "/Library")
+	}
+	return paths
+}
+
+func isWellKnownSystemDeletePath(cleaned, goos string) bool {
+	for _, known := range wellKnownSystemDeletePaths(goos) {
+		if sameDeletePath(cleaned, known, goos) {
 			return true
 		}
 	}
-	if cleaned == string(os.PathSeparator) {
+	return false
+}
+
+func isProtectedDeletePath(cleaned string, extraExact []string, ancestorOf string) bool {
+	return isProtectedDeletePathFor(cleaned, extraExact, ancestorOf, runtime.GOOS)
+}
+
+func isProtectedDeletePathFor(cleaned string, extraExact []string, ancestorOf string, goos string) bool {
+	if isVolumeRootDeletePath(cleaned, goos) {
 		return true
+	}
+	if isWellKnownSystemDeletePath(cleaned, goos) {
+		return true
+	}
+	if strings.TrimSpace(ancestorOf) != "" {
+		if sameDeletePath(cleaned, ancestorOf, goos) || isStrictDeleteAncestor(cleaned, ancestorOf, goos) {
+			return true
+		}
+	}
+	for _, extra := range extraExact {
+		if sameDeletePath(cleaned, extra, goos) {
+			return true
+		}
 	}
 	return false
 }
@@ -1053,7 +1171,7 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 	return fileProperties(newPath, nil)
 }
 
-func fileDelete(rawPaths []string) (map[string]interface{}, error) {
+func fileDelete(rawPaths []string, extraExact []string, ancestorOf string) (map[string]interface{}, error) {
 	if len(rawPaths) == 0 {
 		return nil, fmt.Errorf("missing paths")
 	}
@@ -1073,7 +1191,7 @@ func fileDelete(rawPaths []string) (map[string]interface{}, error) {
 		}
 		result["path"] = cleaned
 
-		if isProtectedDeletePath(cleaned) {
+		if isProtectedDeletePath(cleaned, extraExact, ancestorOf) {
 			result["success"] = false
 			result["error"] = "protected path"
 			results = append(results, result)

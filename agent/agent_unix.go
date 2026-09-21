@@ -1037,7 +1037,7 @@ func FileRenameWindows(rawPath, rawNewName string) (map[string]interface{}, erro
 	return nil, errors.New("file rename is only supported on Windows")
 }
 
-func FileDeleteWindows(rawPaths []string) (map[string]interface{}, error) {
+func FileDeleteWindows(_ *Agent, _ []string) (map[string]interface{}, error) {
 	return nil, errors.New("file delete is only supported on Windows")
 }
 

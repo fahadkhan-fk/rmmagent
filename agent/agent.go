@@ -1294,8 +1294,27 @@ func (a *Agent) FileRename(path, newName string) (map[string]interface{}, error)
 	return fileRename(path, newName)
 }
 
+func (a *Agent) deleteProtectedExactPaths() []string {
+	seen := make(map[string]struct{})
+	out := make([]string, 0, 3)
+	for _, raw := range []string{a.WinTmpDir, a.UnixTmpDir} {
+		raw = strings.TrimSpace(raw)
+		if raw == "" || !filepath.IsAbs(raw) {
+			continue
+		}
+		cleaned := filepath.Clean(raw)
+		key := fsIdentityKey(cleaned)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, cleaned)
+	}
+	return out
+}
+
 func (a *Agent) FileDelete(paths []string) (map[string]interface{}, error) {
-	return fileDelete(paths)
+	return fileDelete(paths, a.deleteProtectedExactPaths(), a.ProgramDir)
 }
 
 func (a *Agent) ReinstallMesh() {

@@ -1122,7 +1122,7 @@ func (a *Agent) RunRPC() {
 				var result map[string]interface{}
 				switch runtime.GOOS {
 				case "windows":
-					result, err = FileDeleteWindows(paths)
+					result, err = FileDeleteWindows(a, paths)
 				default:
 					result, err = a.FileDelete(paths)
 				}

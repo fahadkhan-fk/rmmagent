@@ -33,8 +33,8 @@ func FileRenameWindows(rawPath, rawNewName string) (map[string]interface{}, erro
 	return fileRename(rawPath, rawNewName)
 }
 
-func FileDeleteWindows(rawPaths []string) (map[string]interface{}, error) {
-	return fileDelete(rawPaths)
+func FileDeleteWindows(a *Agent, rawPaths []string) (map[string]interface{}, error) {
+	return a.FileDelete(rawPaths)
 }
 
 func defaultWindowsFileBrowserPathCandidates() []string {
