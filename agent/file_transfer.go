@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"hash"
 	"io"
@@ -13,11 +14,14 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/go-resty/resty/v2"
+	"github.com/shirou/gopsutil/v3/disk"
 )
 
 const (
@@ -44,6 +48,7 @@ const (
 	fileTransferTLSHandshakeTimeout = 15 * time.Second
 	fileTransferMaxIdleConns        = 32
 	fileTransferMaxIdleConnsPerHost = 8
+	fileTransferDiskSpaceMargin     = int64(64 * 1024 * 1024)
 )
 
 var downloadChunkExpectedOffsetRe = regexp.MustCompile(
@@ -68,6 +73,66 @@ func clampInt64(v, min, max int64) int64 {
 		return max
 	}
 	return v
+}
+
+var diskUsage = func(path string) (*disk.UsageStat, error) {
+	return disk.Usage(path)
+}
+
+func uploadRemainingBytes(totalSize, committedOffset int64) int64 {
+	if committedOffset < 0 {
+		committedOffset = 0
+	}
+	if committedOffset >= totalSize {
+		return 0
+	}
+	return totalSize - committedOffset
+}
+
+func ensureDiskSpace(dir string, needed int64, action string) error {
+	if needed <= 0 {
+		return nil
+	}
+	usage, err := diskUsage(dir)
+	if err != nil || usage == nil {
+		return nil
+	}
+	required := needed + fileTransferDiskSpaceMargin
+	if int64(usage.Free) < required {
+		if action == "" {
+			action = "for this transfer"
+		}
+		return fmt.Errorf(
+			"insufficient disk space %s: need ~%d bytes, %d free in %s",
+			action, required, usage.Free, dir,
+		)
+	}
+	return nil
+}
+
+func isNoSpaceError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.ENOSPC) {
+		return true
+	}
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) && pathErr.Err != nil {
+		err = pathErr.Err
+	}
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		if errno == syscall.ENOSPC {
+			return true
+		}
+		// Windows ERROR_DISK_FULL
+		if runtime.GOOS == "windows" && errno == 0x70 {
+			return true
+		}
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, "no space left") || strings.Contains(lower, "disk full")
 }
 
 func clampAtMostInt(v, max int) int {
@@ -646,6 +711,9 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 	writeStart := time.Now()
 	n, err := file.WriteAt(data, start)
 	if err != nil {
+		if isNoSpaceError(err) {
+			return fmt.Errorf("insufficient disk space to upload file")
+		}
 		return fmt.Errorf("failed to write chunk: %w", err)
 	}
 	if int64(n) != expectedLen {

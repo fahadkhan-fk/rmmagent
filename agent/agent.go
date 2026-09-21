@@ -1209,6 +1209,14 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 
 	resume, resumeOffset := parsePayloadResume(p.Data)
+	remaining := totalSize
+	if resume {
+		remaining = uploadRemainingBytes(totalSize, resumeOffset)
+	}
+	if err := ensureDiskSpace(parentDir, remaining, "to upload file"); err != nil {
+		return nil, err
+	}
+
 	partialPath := destinationPath + ".partial"
 	file, committedOffset, err := prepareUploadPartialFile(
 		partialPath, resume, resumeOffset, totalSize,

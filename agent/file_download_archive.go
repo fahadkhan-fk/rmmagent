@@ -15,8 +15,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/shirou/gopsutil/v3/disk"
 )
 
 const (
@@ -24,7 +22,6 @@ const (
 	defaultArchiveMaxFiles     = 10_000
 	defaultArchiveMaxSizeBytes = int64(4 * 1024 * 1024 * 1024) // 4 GiB; ZIP64 when exceeded
 	defaultArchiveMaxDepth     = 32
-	archiveDiskSpaceMargin     = int64(64 * 1024 * 1024)
 	// Prefix used for all temp archive files so a startup sweep can reclaim orphans.
 	archiveTempPrefix  = "trmm-archive-"
 	maxArchiveWarnings = 50
@@ -96,20 +93,7 @@ func (r cancelAwareReader) Read(p []byte) (int, error) {
 }
 
 func ensureArchiveDiskSpace(dir string, needed int64) error {
-	if needed <= 0 {
-		return nil
-	}
-	usage, err := disk.Usage(dir)
-	if err != nil || usage == nil {
-		return nil
-	}
-	if int64(usage.Free) < needed+archiveDiskSpaceMargin {
-		return fmt.Errorf(
-			"insufficient disk space to build archive: need ~%d bytes, %d free in %s",
-			needed+archiveDiskSpaceMargin, usage.Free, dir,
-		)
-	}
-	return nil
+	return ensureDiskSpace(dir, needed, "to build archive")
 }
 
 type archiveLimits struct {
