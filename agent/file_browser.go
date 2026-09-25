@@ -25,8 +25,11 @@ const (
 	defaultFolderSummaryMaxFiles    = 100_000
 	defaultFolderSummaryMaxDepth    = 32
 	defaultFolderSummaryMaxDuration = 20 * time.Second
-	maxFolderSummaryDuration        = 60 * time.Second
+	maxFolderSummaryDuration = 40 * time.Second
+	maxConcurrentFolderSummaries = 2
 )
+
+var folderSummarySlots = make(chan struct{}, maxConcurrentFolderSummaries)
 
 type fileBrowserItem struct {
 	ID        string
@@ -165,6 +168,16 @@ func summarizeFolder(root string, limits folderSummaryLimits) folderSummary {
 	summary := folderSummary{}
 	deadline := time.Now().Add(limits.maxDuration)
 	entriesSeen := 0
+
+	wait := time.NewTimer(limits.maxDuration)
+	select {
+	case folderSummarySlots <- struct{}{}:
+		wait.Stop()
+		defer func() { <-folderSummarySlots }()
+	case <-wait.C:
+		summary.truncated = true
+		return summary
+	}
 
 	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
 		if walkErr != nil {
@@ -819,7 +832,7 @@ func fileProperties(rawPath string, limits *folderSummaryLimits) (map[string]int
 }
 
 func validateFileBrowserName(name string) error {
-	if strings.HasSuffix(name, " ") || strings.HasSuffix(name, ".") {
+	if hasTrailingSpaceOrPeriod(name, runtime.GOOS) {
 		return fmt.Errorf("invalid name")
 	}
 	trimmed := strings.TrimSpace(name)
@@ -855,9 +868,35 @@ func isVolumeRootDeletePath(cleaned, goos string) bool {
 		return false
 	}
 	if goos == "windows" {
-		return len(key) == 2 && key[0] >= 'a' && key[0] <= 'z' && key[1] == ':'
+		return isWindowsVolumeRootKey(key)
 	}
 	return key == "/"
+}
+
+func isWindowsVolumeRootKey(key string) bool {
+	isDrive := func(k string) bool {
+		return len(k) == 2 && k[0] >= 'a' && k[0] <= 'z' && k[1] == ':'
+	}
+	if isDrive(key) {
+		return true
+	}
+	if !strings.HasPrefix(key, `\\`) {
+		return false
+	}
+	rest := key[2:]
+	switch {
+	case strings.HasPrefix(rest, `?\unc\`):
+		rest = rest[len(`?\unc\`):]
+	case strings.HasPrefix(rest, `?\`), strings.HasPrefix(rest, `.\`):
+		return isDrive(strings.TrimRight(rest[2:], `\`))
+	}
+	segments := 0
+	for _, part := range strings.Split(rest, `\`) {
+		if part != "" {
+			segments++
+		}
+	}
+	return segments >= 1 && segments <= 2
 }
 
 func isStrictDeleteAncestor(parent, child, goos string) bool {

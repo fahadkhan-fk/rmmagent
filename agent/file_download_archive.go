@@ -30,35 +30,45 @@ const (
 var (
 	errArchiveCanceled = errors.New("archive cancelled")
 
-	archiveBuildsMu sync.Mutex
-	archiveBuilds   = map[string]context.CancelFunc{}
+	archiveBuildSlots = make(chan struct{}, 2)
+	archiveBuildsMu   sync.Mutex
+	archiveBuilds     = map[string]archiveBuild{}
 )
+
+// archiveBuild is one registered build; ctx identifies it so a finishing
+// build cannot unregister a newer one for the same session.
+type archiveBuild struct {
+	ctx    context.Context
+	cancel context.CancelFunc
+}
 
 func registerArchiveBuild(sessionID string) context.Context {
 	ctx, cancel := context.WithCancel(context.Background())
 	archiveBuildsMu.Lock()
-	if prev, ok := archiveBuilds[sessionID]; ok && prev != nil {
-		prev()
+	if prev, ok := archiveBuilds[sessionID]; ok && prev.cancel != nil {
+		prev.cancel()
 	}
-	archiveBuilds[sessionID] = cancel
+	archiveBuilds[sessionID] = archiveBuild{ctx: ctx, cancel: cancel}
 	archiveBuildsMu.Unlock()
 	return ctx
 }
 
 func cancelArchiveBuild(sessionID string) bool {
 	archiveBuildsMu.Lock()
-	cancel, ok := archiveBuilds[sessionID]
+	build, ok := archiveBuilds[sessionID]
 	archiveBuildsMu.Unlock()
-	if !ok || cancel == nil {
+	if !ok || build.cancel == nil {
 		return false
 	}
-	cancel()
+	build.cancel()
 	return true
 }
 
-func unregisterArchiveBuild(sessionID string) {
+func unregisterArchiveBuild(sessionID string, ctx context.Context) {
 	archiveBuildsMu.Lock()
-	delete(archiveBuilds, sessionID)
+	if build, ok := archiveBuilds[sessionID]; ok && build.ctx == ctx {
+		delete(archiveBuilds, sessionID)
+	}
 	archiveBuildsMu.Unlock()
 }
 
@@ -589,8 +599,17 @@ func (a *Agent) PrepareFilesDownloadArchive(p *NatsMsg) (map[string]interface{},
 func (a *Agent) buildAndServeArchive(
 	ctx context.Context, sessionID string, paths []string, chunkSize int64, limits archiveLimits,
 ) {
-	defer unregisterArchiveBuild(sessionID)
+	defer a.recoverFilesRPC("files_download_archive build", nil)
+	defer unregisterArchiveBuild(sessionID, ctx)
 	ctx = archiveContext(ctx)
+
+	// Builds are disk- and CPU-heavy; run a couple at a time and queue the
+	// rest (still cancellable while they wait).
+	select {
+	case archiveBuildSlots <- struct{}{}:
+		defer func() { <-archiveBuildSlots }()
+	case <-ctx.Done():
+	}
 
 	if err := checkArchiveCanceled(ctx); err != nil {
 		if a.Logger != nil {
@@ -794,6 +813,7 @@ func sweepArchiveTempDir(dir string) int {
 }
 
 func (a *Agent) SweepOrphanedArchives() {
+	a.recoverInterruptedReplaces()
 	removed := sweepArchiveTempDir(a.fileTransferTempDir())
 	osTmp := os.TempDir()
 	if !sameFileTransferDir(osTmp, a.fileTransferTempDir()) {

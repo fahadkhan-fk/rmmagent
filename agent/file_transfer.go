@@ -17,6 +17,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -33,8 +34,6 @@ const (
 	downloadPushMaxAttempts         = 12
 	downloadPushRetryMinBackoff     = 500 * time.Millisecond
 	downloadPushRetryMaxBackoff     = 8 * time.Second
-	downloadPushAckFallbackPoll     = 5 * time.Second
-	downloadPushAckWaitMax          = 120 * time.Second
 	downloadPushAckWaitLogEvery     = 5 * time.Second
 	fileTransferSessionIdleTimeout  = 10 * time.Minute
 	fileTransferReaperInterval      = 2 * time.Minute
@@ -49,6 +48,12 @@ const (
 	fileTransferMaxIdleConns        = 32
 	fileTransferMaxIdleConnsPerHost = 8
 	fileTransferDiskSpaceMargin     = int64(64 * 1024 * 1024)
+)
+
+// Variables rather than constants so tests can shorten them.
+var (
+	downloadPushAckFallbackPoll = 5 * time.Second
+	downloadPushAckWaitMax      = 120 * time.Second
 )
 
 var downloadChunkExpectedOffsetRe = regexp.MustCompile(
@@ -411,7 +416,7 @@ func prepareUploadPartialFile(
 	return file, 0, nil
 }
 
-func replaceUploadPartialWithDestination(partialPath, destinationPath string) error {
+func replaceUploadPartialWithDestination(partialPath, destinationPath, journalDir string) error {
 	if err := rejectUploadDestinationIfDirectory(destinationPath); err != nil {
 		return err
 	}
@@ -434,7 +439,11 @@ func replaceUploadPartialWithDestination(partialPath, destinationPath string) er
 	if err != nil {
 		return err
 	}
+	// Journal the two renames so a crash between them is repaired at the
+	// next start (see recoverInterruptedReplaces).
+	journal := writeReplaceJournal(journalDir, destinationPath, backupPath)
 	if err := os.Rename(destinationPath, backupPath); err != nil {
+		removeReplaceJournal(journal)
 		return fmt.Errorf("failed to move existing destination file: %w", err)
 	}
 	if err := os.Rename(partialPath, destinationPath); err != nil {
@@ -444,11 +453,82 @@ func replaceUploadPartialWithDestination(partialPath, destinationPath string) er
 				err, backupPath, restoreErr,
 			)
 		}
+		removeReplaceJournal(journal)
 		return fmt.Errorf("failed to rename partial file: %w", err)
 	}
 	_ = os.Remove(backupPath)
+	removeReplaceJournal(journal)
 	invalidateFileBrowserListingsFor(destinationPath)
 	return nil
+}
+
+const replaceJournalPrefix = "trmm-replace-"
+
+type replaceJournal struct {
+	Destination string `json:"destination"`
+	Backup      string `json:"backup"`
+}
+
+// writeReplaceJournal records an in-progress replace; it returns "" (and the
+// replace proceeds unjournaled) when the temp dir is not writable.
+func writeReplaceJournal(dir, destination, backup string) string {
+	if strings.TrimSpace(dir) == "" {
+		return ""
+	}
+	data, err := json.Marshal(replaceJournal{Destination: destination, Backup: backup})
+	if err != nil {
+		return ""
+	}
+	f, err := os.CreateTemp(dir, replaceJournalPrefix+"*.json")
+	if err != nil {
+		return ""
+	}
+	_, werr := f.Write(data)
+	serr := f.Sync()
+	cerr := f.Close()
+	if werr != nil || serr != nil || cerr != nil {
+		_ = os.Remove(f.Name())
+		return ""
+	}
+	return f.Name()
+}
+
+func removeReplaceJournal(path string) {
+	if path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+// recoverInterruptedReplaces finishes replaces cut short by a crash: if the
+// destination is gone the original is moved back from its backup, otherwise
+// the leftover backup is removed.
+func (a *Agent) recoverInterruptedReplaces() {
+	dir := a.fileTransferTempDir()
+	matches, _ := filepath.Glob(filepath.Join(dir, replaceJournalPrefix+"*.json"))
+	for _, journalPath := range matches {
+		data, err := os.ReadFile(journalPath)
+		var j replaceJournal
+		if err != nil || json.Unmarshal(data, &j) != nil ||
+			j.Destination == "" || !strings.Contains(filepath.Base(j.Backup), ".trmm-replace") {
+			_ = os.Remove(journalPath)
+			continue
+		}
+		if _, err := os.Lstat(j.Backup); err == nil {
+			if _, derr := os.Lstat(j.Destination); os.IsNotExist(derr) {
+				err = os.Rename(j.Backup, j.Destination)
+			} else {
+				err = os.Remove(j.Backup)
+			}
+			if err != nil && a.Logger != nil {
+				a.Logger.Warnf("file_transfer startup: replace recovery for %s: %v", j.Destination, err)
+				continue
+			}
+			if a.Logger != nil {
+				a.Logger.Infof("file_transfer startup: recovered interrupted replace of %s", j.Destination)
+			}
+		}
+		_ = os.Remove(journalPath)
+	}
 }
 
 func rejectUploadDestinationIfDirectory(path string) error {
@@ -482,8 +562,13 @@ func nextReplaceBackupPath(dest string) (string, error) {
 	return "", fmt.Errorf("failed to allocate replace backup path")
 }
 
+func hasTrailingSpaceOrPeriod(name, goos string) bool {
+	return goos == "windows" &&
+		(strings.HasSuffix(name, " ") || strings.HasSuffix(name, "."))
+}
+
 func validateUploadFilename(filename string) error {
-	if strings.HasSuffix(filename, " ") || strings.HasSuffix(filename, ".") {
+	if hasTrailingSpaceOrPeriod(filename, runtime.GOOS) {
 		return fmt.Errorf("filename cannot end with a space or a period")
 	}
 	if filename == "." || filename == ".." {
@@ -845,12 +930,63 @@ func (a *Agent) discardUploadSession(sessionID, partialPath string) {
 	job.stop()
 }
 
+type uploadFinalizeCall struct {
+	done       chan struct{}
+	result     map[string]interface{}
+	err        error
+	finishedAt time.Time
+}
+
+var (
+	uploadFinalizeMu    sync.Mutex
+	uploadFinalizeCalls = make(map[string]*uploadFinalizeCall)
+)
+
 func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	sessionID, err := parsePayloadString(p.Data, "session_id")
 	if err != nil {
 		return nil, err
 	}
 
+	uploadFinalizeMu.Lock()
+	call, running := uploadFinalizeCalls[sessionID]
+	if !running {
+		call = &uploadFinalizeCall{done: make(chan struct{})}
+		uploadFinalizeCalls[sessionID] = call
+	}
+	uploadFinalizeMu.Unlock()
+	if running {
+		<-call.done
+		return call.result, call.err
+	}
+
+	call.result, call.err = a.finalizeFilesUpload(sessionID, p)
+	uploadFinalizeMu.Lock()
+	call.finishedAt = time.Now()
+	if call.err != nil {
+		// Only successes are remembered; a failed finalize may be retried.
+		delete(uploadFinalizeCalls, sessionID)
+	}
+	uploadFinalizeMu.Unlock()
+	close(call.done)
+	return call.result, call.err
+}
+
+// pruneUploadFinalizeCalls forgets finished finalize results after the idle
+// window; a retry that late would find the transfer long completed.
+func pruneUploadFinalizeCalls(now time.Time) {
+	uploadFinalizeMu.Lock()
+	defer uploadFinalizeMu.Unlock()
+	for id, call := range uploadFinalizeCalls {
+		if !call.finishedAt.IsZero() && now.Sub(call.finishedAt) > fileTransferSessionIdleTimeout {
+			delete(uploadFinalizeCalls, id)
+		}
+	}
+}
+
+func (a *Agent) finalizeFilesUpload(
+	sessionID string, p *NatsMsg,
+) (map[string]interface{}, error) {
 	rawDestinationPath, err := parsePayloadString(p.Data, "destination_path")
 	if err != nil {
 		return nil, err
@@ -960,7 +1096,9 @@ func (a *Agent) FinalizeFilesUpload(p *NatsMsg) (map[string]interface{}, error) 
 		return nil, err
 	}
 
-	if err := replaceUploadPartialWithDestination(partialPath, destinationPath); err != nil {
+	if err := replaceUploadPartialWithDestination(
+		partialPath, destinationPath, a.fileTransferTempDir(),
+	); err != nil {
 		if a.Logger != nil {
 			a.Logger.Warnf(
 				"file_transfer upload finalize session=%s: destination replace failed, "+
@@ -1035,6 +1173,16 @@ type DownloadTransferSession struct {
 	hashLive      bool
 	hashJob       *resumeHashJob
 	RemoveOnClose bool
+	// DormantSince is set when the stream was parked without a client ACK;
+	// the handle is closed but the session stays resumable.
+	DormantSince time.Time
+}
+
+// downloadStreamIsCurrentLocked reports whether stop belongs to the session's
+// live stream. Caller holds DownloadTransferSessionsMu.
+func downloadStreamIsCurrentLocked(session *DownloadTransferSession, stop <-chan struct{}) bool {
+	return session != nil && session.StopStream != nil &&
+		(<-chan struct{})(session.StopStream) == stop
 }
 
 func (a *Agent) HandleDownloadAck(p *NatsMsg) {
@@ -1158,9 +1306,11 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 	if existing, ok := a.DownloadTransferSessions[sessionID]; ok && existing != nil {
 		if existing.StopStream != nil {
 			close(existing.StopStream)
+			existing.StopStream = nil
 		}
 		if existing.File != nil {
 			_ = existing.File.Close()
+			existing.File = nil
 		}
 		oldHashJob = existing.hashJob
 		existing.hashJob = nil
@@ -1206,6 +1356,7 @@ func (a *Agent) PrepareFilesDownload(p *NatsMsg) (map[string]interface{}, error)
 }
 
 func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, startOffset int64) {
+	defer a.recoverFilesRPC("files_download stream", nil)
 	offset := startOffset
 	backoff := downloadPushRetryMinBackoff
 	attempt := 0
@@ -1244,7 +1395,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 					"file_transfer download stream session=%s offset=%d fatal ready err=%v",
 					sessionID, offset, err,
 				)
-				a.failDownloadStream(sessionID, err)
+				a.failDownloadStream(sessionID, stop, err)
 				return
 			}
 			ackWaitStarted = time.Time{}
@@ -1254,7 +1405,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 					"file_transfer download stream session=%s offset=%d exhausted ready retries err=%v",
 					sessionID, offset, err,
 				)
-				a.failDownloadStream(sessionID, err)
+				a.failDownloadStream(sessionID, stop, err)
 				return
 			}
 			a.Logger.Warnf(
@@ -1304,14 +1455,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 				ackWaitStarted = time.Now()
 			}
 			if time.Since(ackWaitStarted) >= downloadPushAckWaitMax {
-				a.Logger.Errorf(
-					"file_transfer download stream session=%s offset=%d exhausted waiting for client ACK",
-					sessionID, offset,
-				)
-				a.failDownloadStream(
-					sessionID,
-					fmt.Errorf("timed out waiting for client ACK at offset %d", offset),
-				)
+				a.parkDownloadStream(sessionID, stop, offset)
 				return
 			}
 			if lastAckWaitLog.IsZero() || time.Since(lastAckWaitLog) >= downloadPushAckWaitLogEvery {
@@ -1354,7 +1498,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 				"file_transfer download stream session=%s offset=%d fatal err=%v",
 				sessionID, offset, err,
 			)
-			a.failDownloadStream(sessionID, err)
+			a.failDownloadStream(sessionID, stop, err)
 			return
 		}
 
@@ -1363,11 +1507,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 				ackWaitStarted = time.Now()
 			}
 			if time.Since(ackWaitStarted) >= downloadPushAckWaitMax {
-				a.Logger.Errorf(
-					"file_transfer download stream session=%s offset=%d exhausted waiting for client ACK: %v",
-					sessionID, offset, err,
-				)
-				a.failDownloadStream(sessionID, err)
+				a.parkDownloadStream(sessionID, stop, offset)
 				return
 			}
 			if lastAckWaitLog.IsZero() || time.Since(lastAckWaitLog) >= downloadPushAckWaitLogEvery {
@@ -1390,7 +1530,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 				"file_transfer download stream session=%s offset=%d exhausted retries err=%v",
 				sessionID, offset, err,
 			)
-			a.failDownloadStream(sessionID, err)
+			a.failDownloadStream(sessionID, stop, err)
 			return
 		}
 
@@ -1447,6 +1587,9 @@ func isRetryableDownloadPushError(err error) bool {
 			strings.Contains(msg, "failed: 429") {
 			return true
 		}
+		if strings.Contains(msg, "not ready for chunk transfer") {
+			return true
+		}
 		return false
 	}
 	// Network / timeout / 5xx / context deadline.
@@ -1462,25 +1605,58 @@ func isDownloadPushAckWaitError(err error) bool {
 		strings.Contains(msg, "Timed out waiting for client to ACK")
 }
 
-func (a *Agent) failDownloadStream(sessionID string, cause error) {
+// parkDownloadStream stops a stream whose client stopped ACKing (paused tab,
+// slow link) and releases the source handle without failing the session, so
+// a later resume re-prepares it. The reaper removes it after the partial
+// retention window if it is never resumed.
+func (a *Agent) parkDownloadStream(sessionID string, stop <-chan struct{}, offset int64) {
 	a.DownloadTransferSessionsMu.Lock()
 	session, ok := a.DownloadTransferSessions[sessionID]
-	if ok && session != nil {
-		delete(a.DownloadTransferSessions, sessionID)
-	} else {
-		session = nil
+	if !ok || !downloadStreamIsCurrentLocked(session, stop) {
+		a.DownloadTransferSessionsMu.Unlock()
+		return
 	}
+	close(session.StopStream)
+	session.StopStream = nil
+	file := session.File
+	session.File = nil
+	hashJob := session.hashJob
+	session.hashJob = nil
+	session.Hasher = nil
+	session.hashLive = false
+	session.DormantSince = time.Now()
+	a.DownloadTransferSessionsMu.Unlock()
+
+	hashJob.stop()
+	if file != nil {
+		_ = file.Close()
+	}
+	a.Logger.Infof(
+		"file_transfer download stream session=%s offset=%d parked: no client ACK for %s; handle released, resumable",
+		sessionID, offset, downloadPushAckWaitMax,
+	)
+}
+
+func (a *Agent) failDownloadStream(sessionID string, stop <-chan struct{}, cause error) {
+	a.DownloadTransferSessionsMu.Lock()
+	session, ok := a.DownloadTransferSessions[sessionID]
+	if !ok || !downloadStreamIsCurrentLocked(session, stop) {
+		// A resume or finalize replaced this stream; the failure belongs to a
+		// stale goroutine and must not touch the new session.
+		a.DownloadTransferSessionsMu.Unlock()
+		a.Logger.Debugf(
+			"file_transfer download stream session=%s stale stream failure ignored: %v",
+			sessionID, cause,
+		)
+		return
+	}
+	delete(a.DownloadTransferSessions, sessionID)
+	close(session.StopStream)
+	session.StopStream = nil
 	a.DownloadTransferSessionsMu.Unlock()
 
 	if session != nil {
 		session.hashJob.stop()
-		if session.StopStream != nil {
-			select {
-			case <-session.StopStream:
-			default:
-				close(session.StopStream)
-			}
-		}
 		if session.File != nil {
 			_ = session.File.Close()
 			session.File = nil
@@ -1668,6 +1844,33 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		return map[string]interface{}{"status": "completed"}, nil
 	}
 	hashJob := session.hashJob
+	if strings.EqualFold(strings.TrimSpace(p.Data["release"]), "true") {
+		// Cancel, fail or expiry: nobody needs the hash, so do not wait for
+		// (or start) a full-file read inside the server's short release call.
+		delete(a.DownloadTransferSessions, sessionID)
+		session.hashJob = nil
+		if session.StopStream != nil {
+			close(session.StopStream)
+			session.StopStream = nil
+		}
+		file := session.File
+		session.File = nil
+		a.DownloadTransferSessionsMu.Unlock()
+		hashJob.stop()
+		if file != nil {
+			_ = file.Close()
+		}
+		if session.RemoveOnClose && session.SourcePath != "" {
+			if err := os.Remove(session.SourcePath); err != nil && !os.IsNotExist(err) {
+				a.Logger.Warnf(
+					"file_transfer download release session=%s: failed to remove archive %s: %v",
+					sessionID, session.SourcePath, err,
+				)
+			}
+		}
+		a.Logger.Infof("file_transfer download released session=%s", sessionID)
+		return map[string]interface{}{"status": "completed"}, nil
+	}
 	a.DownloadTransferSessionsMu.Unlock()
 
 	if err := waitResumeHashJob(hashJob); err != nil && a.Logger != nil {
@@ -1825,6 +2028,7 @@ func hashFileRange(ctx context.Context, h hash.Hash, path string, start, end int
 func (a *Agent) runUploadResumeHash(
 	ctx context.Context, job *resumeHashJob, sessionID, path string, prefix int64,
 ) {
+	defer a.recoverFilesRPC("files_upload resume hash", nil)
 	defer close(job.done)
 	h := sha256.New()
 	if err := hashFileRange(ctx, h, path, 0, prefix); err != nil {
@@ -1880,6 +2084,7 @@ func (a *Agent) runUploadResumeHash(
 func (a *Agent) runDownloadResumeHash(
 	ctx context.Context, job *resumeHashJob, sessionID, path string, prefix int64,
 ) {
+	defer a.recoverFilesRPC("files_download resume hash", nil)
 	defer close(job.done)
 	h := sha256.New()
 	if err := hashFileRange(ctx, h, path, 0, prefix); err != nil {
@@ -1934,6 +2139,7 @@ func (a *Agent) runDownloadResumeHash(
 
 func (a *Agent) ReapStaleFileTransferSessions() {
 	now := time.Now()
+	pruneUploadFinalizeCalls(now)
 
 	type uploadCloseJob struct {
 		sessionID string
@@ -1994,6 +2200,15 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 	for id, session := range a.DownloadTransferSessions {
 		if session == nil {
 			delete(a.DownloadTransferSessions, id)
+			continue
+		}
+		if !session.DormantSince.IsZero() {
+			// Parked for a paused client: keep it (and any archive) resumable
+			// for the same window as an upload .partial.
+			if now.Sub(session.DormantSince) > fileTransferPartialRetention {
+				staleDownloads = append(staleDownloads, session)
+				delete(a.DownloadTransferSessions, id)
+			}
 			continue
 		}
 		if now.Sub(session.LastActivity) > fileTransferSessionIdleTimeout {
