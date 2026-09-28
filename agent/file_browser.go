@@ -25,8 +25,8 @@ const (
 	defaultFolderSummaryMaxFiles    = 100_000
 	defaultFolderSummaryMaxDepth    = 32
 	defaultFolderSummaryMaxDuration = 20 * time.Second
-	maxFolderSummaryDuration = 40 * time.Second
-	maxConcurrentFolderSummaries = 2
+	maxFolderSummaryDuration        = 40 * time.Second
+	maxConcurrentFolderSummaries    = 2
 )
 
 var folderSummarySlots = make(chan struct{}, maxConcurrentFolderSummaries)
@@ -961,9 +961,18 @@ func wellKnownSystemDeletePaths(goos string) []string {
 		"/bin", "/sbin", "/usr", "/usr/bin", "/usr/sbin", "/usr/lib", "/usr/lib64",
 		"/lib", "/lib64", "/etc", "/boot", "/dev", "/proc", "/sys", "/run",
 		"/root", "/home", "/opt", "/var", "/usr/local", "/Users",
+		"/usr/local/bin", "/usr/local/sbin", "/usr/local/lib", "/usr/share",
+		"/lib32", "/libx32", "/usr/lib32", "/var/lib", "/var/log", "/var/cache",
+		"/srv", "/mnt", "/media", "/snap", "/tmp",
 	}
 	if goos == "darwin" {
-		paths = append(paths, "/System", "/Library")
+		// /etc, /var and /tmp are symlinks into /private on macOS; protect
+		// the real directories too.
+		paths = append(paths,
+			"/System", "/Library", "/Applications", "/Volumes",
+			"/private", "/private/etc", "/private/var", "/private/tmp",
+			"/Library/LaunchDaemons", "/Library/LaunchAgents",
+		)
 	}
 	return paths
 }
@@ -977,18 +986,21 @@ func isWellKnownSystemDeletePath(cleaned, goos string) bool {
 	return false
 }
 
-func isProtectedDeletePath(cleaned string, extraExact []string, ancestorOf string) bool {
-	return isProtectedDeletePathFor(cleaned, extraExact, ancestorOf, runtime.GOOS)
+func isProtectedDeletePath(cleaned string, extraExact []string, ancestorsOf []string) bool {
+	return isProtectedDeletePathFor(cleaned, extraExact, ancestorsOf, runtime.GOOS)
 }
 
-func isProtectedDeletePathFor(cleaned string, extraExact []string, ancestorOf string, goos string) bool {
+func isProtectedDeletePathFor(cleaned string, extraExact []string, ancestorsOf []string, goos string) bool {
 	if isVolumeRootDeletePath(cleaned, goos) {
 		return true
 	}
 	if isWellKnownSystemDeletePath(cleaned, goos) {
 		return true
 	}
-	if strings.TrimSpace(ancestorOf) != "" {
+	for _, ancestorOf := range ancestorsOf {
+		if strings.TrimSpace(ancestorOf) == "" {
+			continue
+		}
 		if sameDeletePath(cleaned, ancestorOf, goos) || isStrictDeleteAncestor(cleaned, ancestorOf, goos) {
 			return true
 		}
@@ -1210,7 +1222,7 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 	return fileProperties(newPath, nil)
 }
 
-func fileDelete(rawPaths []string, extraExact []string, ancestorOf string) (map[string]interface{}, error) {
+func fileDelete(rawPaths []string, extraExact []string, ancestorsOf []string) (map[string]interface{}, error) {
 	if len(rawPaths) == 0 {
 		return nil, fmt.Errorf("missing paths")
 	}
@@ -1230,7 +1242,7 @@ func fileDelete(rawPaths []string, extraExact []string, ancestorOf string) (map[
 		}
 		result["path"] = cleaned
 
-		if isProtectedDeletePath(cleaned, extraExact, ancestorOf) {
+		if isProtectedDeletePath(cleaned, extraExact, ancestorsOf) {
 			result["success"] = false
 			result["error"] = "protected path"
 			results = append(results, result)

@@ -1321,8 +1321,27 @@ func (a *Agent) deleteProtectedExactPaths() []string {
 	return out
 }
 
+func (a *Agent) deleteProtectedAgentPaths() []string {
+	var paths []string
+	switch runtime.GOOS {
+	case "windows":
+		paths = []string{a.ProgramDir}
+	case "darwin":
+		paths = []string{nixAgentBin, etcConfig, macPlistPath}
+	default:
+		paths = []string{etcConfig}
+	}
+	if self, err := os.Executable(); err == nil {
+		if resolved, rerr := filepath.EvalSymlinks(self); rerr == nil {
+			self = resolved
+		}
+		paths = append(paths, self)
+	}
+	return paths
+}
+
 func (a *Agent) FileDelete(paths []string) (map[string]interface{}, error) {
-	return fileDelete(paths, a.deleteProtectedExactPaths(), a.ProgramDir)
+	return fileDelete(paths, a.deleteProtectedExactPaths(), a.deleteProtectedAgentPaths())
 }
 
 func (a *Agent) ReinstallMesh() {
