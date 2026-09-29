@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"os"
@@ -1049,7 +1050,20 @@ func mapDeleteError(err error) string {
 	if os.IsPermission(err) {
 		return "permission denied"
 	}
-	return "unable to delete path"
+	return "unable to delete path: " + osErrorReason(err)
+}
+
+// osErrorReason strips the path from the OS error.
+func osErrorReason(err error) string {
+	var pathErr *os.PathError
+	if errors.As(err, &pathErr) {
+		return pathErr.Err.Error()
+	}
+	var linkErr *os.LinkError
+	if errors.As(err, &linkErr) {
+		return linkErr.Err.Error()
+	}
+	return err.Error()
 }
 
 func parseDeletePaths(raw string) ([]string, error) {
@@ -1215,7 +1229,7 @@ func fileRename(rawPath, rawNewName string) (map[string]interface{}, error) {
 				"This destination already contains a file named %q", newName,
 			)
 		}
-		return nil, fmt.Errorf("unable to rename path")
+		return nil, fmt.Errorf("unable to rename path: %s", osErrorReason(err))
 	}
 
 	invalidateFileBrowserListingsFor(cleaned, newPath)

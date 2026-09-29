@@ -54,6 +54,7 @@ const (
 var (
 	downloadPushAckFallbackPoll = 5 * time.Second
 	downloadPushAckWaitMax      = 120 * time.Second
+	uploadDrainRetryWindow      = 10 * time.Minute
 )
 
 var downloadChunkExpectedOffsetRe = regexp.MustCompile(
@@ -503,7 +504,7 @@ func removeReplaceJournal(path string) {
 // destination is gone the original is moved back from its backup, otherwise
 // the leftover backup is removed.
 func (a *Agent) recoverInterruptedReplaces() {
-	dir := a.fileTransferTempDir()
+	dir := a.fileTransferStateDir()
 	matches, _ := filepath.Glob(filepath.Join(dir, replaceJournalPrefix+"*.json"))
 	for _, journalPath := range matches {
 		data, err := os.ReadFile(journalPath)
@@ -531,6 +532,126 @@ func (a *Agent) recoverInterruptedReplaces() {
 	}
 }
 
+const uploadPartialJournalPrefix = "trmm-upload-"
+
+// uploadPartialJournal lets us find a .partial after an agent restart.
+type uploadPartialJournal struct {
+	SessionID string `json:"session_id"`
+	Partial   string `json:"partial"`
+}
+
+func (a *Agent) uploadPartialJournalPath(sessionID string) string {
+	dir := a.fileTransferStateDir()
+	if strings.TrimSpace(dir) == "" || sessionID == "" || filepath.Base(sessionID) != sessionID {
+		return ""
+	}
+	return filepath.Join(dir, uploadPartialJournalPrefix+sessionID+".json")
+}
+
+func (a *Agent) writeUploadPartialJournal(sessionID, partial string) {
+	path := a.uploadPartialJournalPath(sessionID)
+	if path == "" {
+		return
+	}
+	data, err := json.Marshal(uploadPartialJournal{SessionID: sessionID, Partial: partial})
+	if err != nil {
+		return
+	}
+	if err := os.WriteFile(path, data, 0o600); err != nil && a.Logger != nil {
+		a.Logger.Debugf("file_transfer upload session=%s: partial journal not written: %v", sessionID, err)
+	}
+}
+
+func (a *Agent) removeUploadPartialJournal(sessionID string) {
+	if path := a.uploadPartialJournalPath(sessionID); path != "" {
+		_ = os.Remove(path)
+	}
+}
+
+func readUploadPartialJournal(path string) (uploadPartialJournal, bool) {
+	var j uploadPartialJournal
+	data, err := os.ReadFile(path)
+	if err != nil || json.Unmarshal(data, &j) != nil ||
+		j.SessionID == "" || !strings.HasSuffix(j.Partial, ".partial") {
+		return j, false
+	}
+	return j, true
+}
+
+func (a *Agent) uploadPartialInUse(sessionID, partial string) bool {
+	a.FileTransferSessionsMu.Lock()
+	defer a.FileTransferSessionsMu.Unlock()
+	for id, s := range a.FileTransferSessions {
+		if s != nil && (id == sessionID || s.PartialPath == partial) {
+			return true
+		}
+	}
+	return false
+}
+
+func (a *Agent) removeJournaledUploadPartial(sessionID string) string {
+	path := a.uploadPartialJournalPath(sessionID)
+	if path == "" {
+		return ""
+	}
+	j, ok := readUploadPartialJournal(path)
+	_ = os.Remove(path)
+	if !ok || j.SessionID != sessionID || a.uploadPartialInUse("", j.Partial) {
+		return ""
+	}
+	if info, err := os.Lstat(j.Partial); err != nil || !info.Mode().IsRegular() {
+		return ""
+	}
+	if err := os.Remove(j.Partial); err != nil {
+		return ""
+	}
+	return j.Partial
+}
+
+// sweepOrphanedUploadPartials removes partials left by a restart once they're
+// past the retention window.
+func (a *Agent) sweepOrphanedUploadPartials(now time.Time) int {
+	dir := a.fileTransferStateDir()
+	if strings.TrimSpace(dir) == "" {
+		return 0
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, uploadPartialJournalPrefix+"*.json"))
+	removed := 0
+	for _, journalPath := range matches {
+		j, ok := readUploadPartialJournal(journalPath)
+		if !ok {
+			_ = os.Remove(journalPath)
+			continue
+		}
+		if a.uploadPartialInUse(j.SessionID, j.Partial) {
+			continue
+		}
+		info, err := os.Lstat(j.Partial)
+		if os.IsNotExist(err) || (err == nil && !info.Mode().IsRegular()) {
+			_ = os.Remove(journalPath)
+			continue
+		}
+		if err != nil || now.Sub(info.ModTime()) < fileTransferPartialRetention {
+			continue
+		}
+		if err := os.Remove(j.Partial); err != nil {
+			if a.Logger != nil {
+				a.Logger.Warnf("file_transfer: failed to remove orphaned partial %s: %v", j.Partial, err)
+			}
+			continue
+		}
+		_ = os.Remove(journalPath)
+		removed++
+		if a.Logger != nil {
+			a.Logger.Infof(
+				"file_transfer: removed orphaned partial %s (session=%s, no activity for %s)",
+				j.Partial, j.SessionID, fileTransferPartialRetention,
+			)
+		}
+	}
+	return removed
+}
+
 func rejectUploadDestinationIfDirectory(path string) error {
 	info, err := os.Lstat(path)
 	if err != nil {
@@ -545,11 +666,28 @@ func rejectUploadDestinationIfDirectory(path string) error {
 	return nil
 }
 
+const maxFileNameBytes = 255
+
+// siblingWithSuffix falls back to a hashed name when path+suffix would be too
+// long for the filesystem.
+func siblingWithSuffix(path, suffix string) string {
+	base := filepath.Base(path)
+	if len(base)+len(suffix) <= maxFileNameBytes {
+		return path + suffix
+	}
+	sum := sha256.Sum256([]byte(base))
+	return filepath.Join(filepath.Dir(path), "."+hex.EncodeToString(sum[:8])+suffix)
+}
+
+func uploadPartialPath(destinationPath string) string {
+	return siblingWithSuffix(destinationPath, ".partial")
+}
+
 func nextReplaceBackupPath(dest string) (string, error) {
 	for i := 0; i < 100; i++ {
-		candidate := dest + ".trmm-replace"
+		candidate := siblingWithSuffix(dest, ".trmm-replace")
 		if i > 0 {
-			candidate = fmt.Sprintf("%s.trmm-replace-%d", dest, i)
+			candidate = siblingWithSuffix(dest, fmt.Sprintf(".trmm-replace-%d", i))
 		}
 		_, err := os.Lstat(candidate)
 		if os.IsNotExist(err) {
@@ -648,15 +786,14 @@ func (a *Agent) HandleUploadChunkAvailable(p *NatsMsg) (map[string]interface{}, 
 	session.Draining = true
 	a.FileTransferSessionsMu.Unlock()
 
+	// only clear our own session's flag, a resume may have replaced it
 	defer func() {
 		a.FileTransferSessionsMu.Lock()
-		if s, ok := a.FileTransferSessions[sessionID]; ok && s != nil {
-			s.Draining = false
-		}
+		session.Draining = false
 		a.FileTransferSessionsMu.Unlock()
 	}()
 
-	committedOffset, err := a.drainUploadChunks(sessionID)
+	committedOffset, err := a.drainUploadChunks(sessionID, session)
 	if err != nil {
 		return nil, err
 	}
@@ -667,14 +804,14 @@ func (a *Agent) HandleUploadChunkAvailable(p *NatsMsg) (map[string]interface{}, 
 	}, nil
 }
 
-func (a *Agent) drainUploadChunks(sessionID string) (int64, error) {
+func (a *Agent) drainUploadChunks(sessionID string, owner *UploadTransferSession) (int64, error) {
 	url := fmt.Sprintf("/api/v3/file-transfers/%s/next-chunk/", sessionID)
 
 	readState := func() (int64, int64, bool) {
 		a.FileTransferSessionsMu.Lock()
 		defer a.FileTransferSessionsMu.Unlock()
 		s, ok := a.FileTransferSessions[sessionID]
-		if !ok || s == nil {
+		if !ok || s == nil || s != owner {
 			return 0, 0, false
 		}
 		return s.CommittedOffset, s.TotalSize, true
@@ -687,6 +824,34 @@ func (a *Agent) drainUploadChunks(sessionID string) (int64, error) {
 
 	backoff := fileTransferDrainMinBackoff
 	idleDeadline := time.Now().Add(fileTransferDrainIdleTimeout)
+	retryBackoff := downloadPushRetryMinBackoff
+	var retryStarted time.Time
+
+	// Don't give up on a network error, the server won't notify us again while
+	// the browser's pipeline is full.
+	retry := func(err error) bool {
+		if !isRetryableUploadDrainError(err) {
+			return false
+		}
+		if retryStarted.IsZero() {
+			retryStarted = time.Now()
+		}
+		if time.Since(retryStarted) > uploadDrainRetryWindow {
+			return false
+		}
+		a.Logger.Warnf(
+			"file_transfer upload drain session=%s committed_offset=%d retry after %v: %v",
+			sessionID, committedOffset, retryBackoff, err,
+		)
+		time.Sleep(retryBackoff)
+		retryBackoff *= 2
+		if retryBackoff > downloadPushRetryMaxBackoff {
+			retryBackoff = downloadPushRetryMaxBackoff
+		}
+		// restart the idle window after an outage
+		idleDeadline = time.Now().Add(fileTransferDrainIdleTimeout)
+		return true
+	}
 
 	for committedOffset < totalSize {
 		fetchStart := time.Now()
@@ -697,14 +862,30 @@ func (a *Agent) drainUploadChunks(sessionID string) (int64, error) {
 			Get(url)
 		cancel()
 		if err != nil {
-			return committedOffset, fmt.Errorf("failed to pull upload chunk: %w", err)
+			err = fmt.Errorf("failed to pull upload chunk: %w", err)
+			if _, _, ok := readState(); ok && retry(err) {
+				continue
+			}
+			return committedOffset, err
 		}
 
 		switch resp.StatusCode() {
 		case 200:
-			if err := a.applyUploadChunk(sessionID, resp); err != nil {
+			if err := a.applyUploadChunk(sessionID, owner, resp); err != nil {
+				if errors.Is(err, errUploadSessionReplaced) {
+					return committedOffset, nil
+				}
+				if isUploadWriteError(err) {
+					a.reportFileTransferFailure(sessionID, err.Error())
+					return committedOffset, err
+				}
+				if _, _, ok := readState(); ok && retry(err) {
+					continue
+				}
 				return committedOffset, err
 			}
+			retryStarted = time.Time{}
+			retryBackoff = downloadPushRetryMinBackoff
 			committedOffset, totalSize, ok = readState()
 			if !ok {
 				return committedOffset, fmt.Errorf("upload session not found")
@@ -731,18 +912,58 @@ func (a *Agent) drainUploadChunks(sessionID string) (int64, error) {
 				backoff = fileTransferDrainMaxBackoff
 			}
 		default:
-			return committedOffset, fmt.Errorf(
+			err := fmt.Errorf(
 				"pull upload chunk failed: %d %s",
 				resp.StatusCode(),
 				string(resp.Body()),
 			)
+			if _, _, ok := readState(); ok && retry(err) {
+				continue
+			}
+			return committedOffset, err
 		}
 	}
 
 	return committedOffset, nil
 }
 
-func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
+var errUploadSessionReplaced = errors.New("upload session was re-prepared by a resume")
+
+func isRetryableUploadDrainError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	if strings.Contains(msg, "failed to pull upload chunk:") ||
+		strings.Contains(msg, "failed to ack upload chunk:") ||
+		strings.Contains(msg, "chunk body size does not match Content-Range") {
+		return true
+	}
+	for _, prefix := range []string{"pull upload chunk failed: ", "upload chunk ack failed: "} {
+		i := strings.Index(msg, prefix)
+		if i < 0 {
+			continue
+		}
+		code := msg[i+len(prefix):]
+		return strings.HasPrefix(code, "5") ||
+			strings.HasPrefix(code, "408") ||
+			strings.HasPrefix(code, "425") ||
+			strings.HasPrefix(code, "429")
+	}
+	return false
+}
+
+func isUploadWriteError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "insufficient disk space to upload file") ||
+		strings.Contains(msg, "failed to write chunk") ||
+		strings.Contains(msg, "short write for upload chunk")
+}
+
+func (a *Agent) applyUploadChunk(sessionID string, owner *UploadTransferSession, resp *resty.Response) error {
 	start, end, err := parseUploadChunkHeaders(resp)
 	if err != nil {
 		return err
@@ -759,6 +980,10 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 	if !ok || session == nil {
 		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("upload session not found")
+	}
+	if session != owner {
+		a.FileTransferSessionsMu.Unlock()
+		return errUploadSessionReplaced
 	}
 	if session.File == nil {
 		a.FileTransferSessionsMu.Unlock()
@@ -811,6 +1036,10 @@ func (a *Agent) applyUploadChunk(sessionID string, resp *resty.Response) error {
 	if !ok || session == nil {
 		a.FileTransferSessionsMu.Unlock()
 		return fmt.Errorf("upload session not found after write")
+	}
+	if session != owner {
+		a.FileTransferSessionsMu.Unlock()
+		return errUploadSessionReplaced
 	}
 	if start != session.CommittedOffset {
 		a.FileTransferSessionsMu.Unlock()
@@ -909,6 +1138,7 @@ func (a *Agent) markUploadDormant(sessionID string) {
 }
 
 func (a *Agent) discardUploadSession(sessionID, partialPath string) {
+	a.removeUploadPartialJournal(sessionID)
 	if partialPath != "" {
 		if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
 			if a.Logger != nil {
@@ -1034,7 +1264,7 @@ func (a *Agent) finalizeFilesUpload(
 
 	partialPath := session.PartialPath
 	if partialPath == "" {
-		partialPath = destinationPath + ".partial"
+		partialPath = uploadPartialPath(destinationPath)
 	}
 	file := session.File
 	hasher := session.Hasher
@@ -1097,7 +1327,7 @@ func (a *Agent) finalizeFilesUpload(
 	}
 
 	if err := replaceUploadPartialWithDestination(
-		partialPath, destinationPath, a.fileTransferTempDir(),
+		partialPath, destinationPath, a.fileTransferStateDir(),
 	); err != nil {
 		if a.Logger != nil {
 			a.Logger.Warnf(
@@ -1112,6 +1342,7 @@ func (a *Agent) finalizeFilesUpload(
 	a.FileTransferSessionsMu.Lock()
 	delete(a.FileTransferSessions, sessionID)
 	a.FileTransferSessionsMu.Unlock()
+	a.removeUploadPartialJournal(sessionID)
 
 	return map[string]interface{}{
 		"status":           "completed",
@@ -1130,6 +1361,13 @@ func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	session, ok := a.FileTransferSessions[sessionID]
 	if !ok || session == nil {
 		a.FileTransferSessionsMu.Unlock()
+		// agent restarted since the upload started
+		if removed := a.removeJournaledUploadPartial(sessionID); removed != "" {
+			a.Logger.Infof(
+				"file_transfer upload aborted session=%s: removed partial %s left from before a restart",
+				sessionID, removed,
+			)
+		}
 		return map[string]interface{}{"status": "aborted"}, nil
 	}
 	file := session.File
@@ -1154,6 +1392,7 @@ func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		}
 	}
 
+	a.removeUploadPartialJournal(sessionID)
 	a.Logger.Infof("file_transfer upload aborted session=%s", sessionID)
 	return map[string]interface{}{"status": "aborted"}, nil
 }
@@ -1183,6 +1422,12 @@ type DownloadTransferSession struct {
 func downloadStreamIsCurrentLocked(session *DownloadTransferSession, stop <-chan struct{}) bool {
 	return session != nil && session.StopStream != nil &&
 		(<-chan struct{})(session.StopStream) == stop
+}
+
+func (a *Agent) downloadStreamIsCurrent(sessionID string, stop <-chan struct{}) bool {
+	a.DownloadTransferSessionsMu.Lock()
+	defer a.DownloadTransferSessionsMu.Unlock()
+	return downloadStreamIsCurrentLocked(a.DownloadTransferSessions[sessionID], stop)
 }
 
 func (a *Agent) HandleDownloadAck(p *NatsMsg) {
@@ -1494,6 +1739,14 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 		}
 
 		if !isRetryableDownloadPushError(err) {
+			if !a.downloadStreamIsCurrent(sessionID, stop) {
+				// cancelled or resumed while this push was in flight
+				a.Logger.Debugf(
+					"file_transfer download stream session=%s offset=%d stale stream stopped: %v",
+					sessionID, offset, err,
+				)
+				return
+			}
 			a.Logger.Errorf(
 				"file_transfer download stream session=%s offset=%d fatal err=%v",
 				sessionID, offset, err,
@@ -2180,6 +2433,7 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 	}
 	for _, session := range toRemove {
 		session.hashJob.stop()
+		a.removeUploadPartialJournal(session.SessionID)
 		if session.PartialPath != "" {
 			if err := os.Remove(session.PartialPath); err != nil && !os.IsNotExist(err) {
 				a.Logger.Warnf(
@@ -2239,4 +2493,6 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 			session.SessionID, now.Sub(session.LastActivity).Round(time.Second),
 		)
 	}
+
+	a.sweepOrphanedUploadPartials(now)
 }

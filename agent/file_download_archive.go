@@ -183,6 +183,19 @@ func sameFileTransferDir(a, b string) bool {
 	return a == b
 }
 
+// fileTransferStateDir is where the journals go. Not /tmp, they need to
+// survive a reboot.
+func (a *Agent) fileTransferStateDir() string {
+	if runtime.GOOS == "windows" || (a != nil && strings.TrimSpace(a.UnixTmpDir) != "") {
+		return a.fileTransferTempDir()
+	}
+	dir := filepath.Join(nixAgentDir, "transfers")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return a.fileTransferTempDir()
+	}
+	return dir
+}
+
 func (a *Agent) fileTransferTempDir() string {
 	if runtime.GOOS == "windows" {
 		if a != nil && strings.TrimSpace(a.WinTmpDir) != "" {
@@ -284,6 +297,10 @@ func collectArchiveEntries(
 		if info.Mode()&os.ModeSymlink != 0 {
 			return nil, nil, warnings, 0, fmt.Errorf("symbolic links cannot be archived: %s", root)
 		}
+		if !info.IsDir() && !info.Mode().IsRegular() {
+			// fifos block on open and devices never end
+			return nil, nil, warnings, 0, fmt.Errorf("not a regular file: %s", root)
+		}
 
 		rootBase := filepath.Base(root)
 		if rootBase == "" || rootBase == "." || rootBase == string(filepath.Separator) {
@@ -336,6 +353,10 @@ func collectArchiveEntries(
 				}
 				if entryInfo.Mode()&os.ModeSymlink != 0 {
 					warnings = append(warnings, fmt.Sprintf("skipped symlink %s", path))
+					return nil
+				}
+				if !d.IsDir() && !entryInfo.Mode().IsRegular() {
+					warnings = append(warnings, fmt.Sprintf("skipped %s: not a regular file", path))
 					return nil
 				}
 
@@ -822,4 +843,5 @@ func (a *Agent) SweepOrphanedArchives() {
 	if removed > 0 && a.Logger != nil {
 		a.Logger.Infof("file_transfer startup: removed %d orphaned archive temp file(s)", removed)
 	}
+	a.sweepOrphanedUploadPartials(time.Now())
 }

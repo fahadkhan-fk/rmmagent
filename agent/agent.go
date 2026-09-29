@@ -1217,7 +1217,7 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		return nil, err
 	}
 
-	partialPath := destinationPath + ".partial"
+	partialPath := uploadPartialPath(destinationPath)
 	file, committedOffset, err := prepareUploadPartialFile(
 		partialPath, resume, resumeOffset, totalSize,
 	)
@@ -1271,6 +1271,7 @@ func (a *Agent) PrepareFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 	a.FileTransferSessions[sessionID] = session
 	a.FileTransferSessionsMu.Unlock()
+	a.writeUploadPartialJournal(sessionID, partialPath)
 	oldHashJob.stop()
 	if resumeJob != nil {
 		go a.runUploadResumeHash(resumeCtx, resumeJob, sessionID, partialPath, committedOffset)
