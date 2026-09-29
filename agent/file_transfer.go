@@ -521,11 +521,11 @@ func (a *Agent) recoverInterruptedReplaces() {
 				err = os.Remove(j.Backup)
 			}
 			if err != nil && a.Logger != nil {
-				a.Logger.Warnf("file_transfer startup: replace recovery for %s: %v", j.Destination, err)
+				a.Logger.Errorf("file_transfer startup: replace recovery for %s: %v", j.Destination, err)
 				continue
 			}
 			if a.Logger != nil {
-				a.Logger.Infof("file_transfer startup: recovered interrupted replace of %s", j.Destination)
+				a.Logger.Debugf("file_transfer startup: recovered interrupted replace of %s", j.Destination)
 			}
 		}
 		_ = os.Remove(journalPath)
@@ -636,14 +636,14 @@ func (a *Agent) sweepOrphanedUploadPartials(now time.Time) int {
 		}
 		if err := os.Remove(j.Partial); err != nil {
 			if a.Logger != nil {
-				a.Logger.Warnf("file_transfer: failed to remove orphaned partial %s: %v", j.Partial, err)
+				a.Logger.Errorf("file_transfer: failed to remove orphaned partial %s: %v", j.Partial, err)
 			}
 			continue
 		}
 		_ = os.Remove(journalPath)
 		removed++
 		if a.Logger != nil {
-			a.Logger.Infof(
+			a.Logger.Debugf(
 				"file_transfer: removed orphaned partial %s (session=%s, no activity for %s)",
 				j.Partial, j.SessionID, fileTransferPartialRetention,
 			)
@@ -839,7 +839,7 @@ func (a *Agent) drainUploadChunks(sessionID string, owner *UploadTransferSession
 		if time.Since(retryStarted) > uploadDrainRetryWindow {
 			return false
 		}
-		a.Logger.Warnf(
+		a.Logger.Debugf(
 			"file_transfer upload drain session=%s committed_offset=%d retry after %v: %v",
 			sessionID, committedOffset, retryBackoff, err,
 		)
@@ -890,7 +890,7 @@ func (a *Agent) drainUploadChunks(sessionID string, owner *UploadTransferSession
 			if !ok {
 				return committedOffset, fmt.Errorf("upload session not found")
 			}
-			a.Logger.Infof(
+			a.Logger.Debugf(
 				"file_transfer chunk session=%s chunk_fetch_ms=%d committed_offset=%d",
 				sessionID,
 				time.Since(fetchStart).Milliseconds(),
@@ -1002,7 +1002,7 @@ func (a *Agent) applyUploadChunk(sessionID string, owner *UploadTransferSession,
 		if err := a.ackUploadChunk(sessionID, committedOffset); err != nil {
 			return err
 		}
-		a.Logger.Infof(
+		a.Logger.Debugf(
 			"file_transfer chunk session=%s chunk_reack_ms=%d offset=%d",
 			sessionID,
 			time.Since(ackStart).Milliseconds(),
@@ -1058,7 +1058,7 @@ func (a *Agent) applyUploadChunk(sessionID string, owner *UploadTransferSession,
 	}
 	ackMs := time.Since(ackStart).Milliseconds()
 
-	a.Logger.Infof(
+	a.Logger.Debugf(
 		"file_transfer chunk session=%s chunk_write_ms=%d chunk_ack_ms=%d bytes=%d offset=%d",
 		sessionID,
 		writeMs,
@@ -1142,7 +1142,7 @@ func (a *Agent) discardUploadSession(sessionID, partialPath string) {
 	if partialPath != "" {
 		if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
 			if a.Logger != nil {
-				a.Logger.Warnf(
+				a.Logger.Errorf(
 					"file_transfer upload session=%s: failed to remove partial %s: %v",
 					sessionID, partialPath, err,
 				)
@@ -1249,7 +1249,7 @@ func (a *Agent) finalizeFilesUpload(
 	a.FileTransferSessionsMu.Unlock()
 
 	if err := waitResumeHashJob(hashJob); err != nil && a.Logger != nil {
-		a.Logger.Warnf(
+		a.Logger.Debugf(
 			"file_transfer upload finalize session=%s: resume prefix hash: %v",
 			sessionID, err,
 		)
@@ -1330,7 +1330,7 @@ func (a *Agent) finalizeFilesUpload(
 		partialPath, destinationPath, a.fileTransferStateDir(),
 	); err != nil {
 		if a.Logger != nil {
-			a.Logger.Warnf(
+			a.Logger.Debugf(
 				"file_transfer upload finalize session=%s: destination replace failed, "+
 					".partial retained at %s: %v",
 				sessionID, partialPath, err,
@@ -1363,7 +1363,7 @@ func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 		a.FileTransferSessionsMu.Unlock()
 		// agent restarted since the upload started
 		if removed := a.removeJournaledUploadPartial(sessionID); removed != "" {
-			a.Logger.Infof(
+			a.Logger.Debugf(
 				"file_transfer upload aborted session=%s: removed partial %s left from before a restart",
 				sessionID, removed,
 			)
@@ -1385,7 +1385,7 @@ func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 	if partialPath != "" {
 		if err := os.Remove(partialPath); err != nil && !os.IsNotExist(err) {
-			a.Logger.Warnf(
+			a.Logger.Errorf(
 				"file_transfer upload abort session=%s: failed to remove partial %s: %v",
 				sessionID, partialPath, err,
 			)
@@ -1393,7 +1393,7 @@ func (a *Agent) AbortFilesUpload(p *NatsMsg) (map[string]interface{}, error) {
 	}
 
 	a.removeUploadPartialJournal(sessionID)
-	a.Logger.Infof("file_transfer upload aborted session=%s", sessionID)
+	a.Logger.Debugf("file_transfer upload aborted session=%s", sessionID)
 	return map[string]interface{}{"status": "aborted"}, nil
 }
 
@@ -1626,7 +1626,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 		a.DownloadTransferSessionsMu.Unlock()
 
 		if offset >= totalSize {
-			a.Logger.Infof(
+			a.Logger.Debugf(
 				"file_transfer download stream session=%s complete offset=%d",
 				sessionID, offset,
 			)
@@ -1653,7 +1653,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 				a.failDownloadStream(sessionID, stop, err)
 				return
 			}
-			a.Logger.Warnf(
+			a.Logger.Debugf(
 				"file_transfer download stream session=%s offset=%d ready retry %d/%d backoff=%s err=%v",
 				sessionID, offset, attempt, downloadPushMaxAttempts, backoff, err,
 			)
@@ -1684,7 +1684,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 		}
 
 		if ready.OfferedOffset > offset {
-			a.Logger.Warnf(
+			a.Logger.Debugf(
 				"file_transfer download stream session=%s re-sync offset %d → %d",
 				sessionID, offset, ready.OfferedOffset,
 			)
@@ -1727,7 +1727,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 		}
 
 		if synced, ok := parseExpectedDownloadOffset(err); ok && synced > offset {
-			a.Logger.Warnf(
+			a.Logger.Debugf(
 				"file_transfer download stream session=%s re-sync offset %d → %d (%v)",
 				sessionID, offset, synced, err,
 			)
@@ -1787,7 +1787,7 @@ func (a *Agent) streamDownloadChunks(sessionID string, stop <-chan struct{}, sta
 			return
 		}
 
-		a.Logger.Warnf(
+		a.Logger.Debugf(
 			"file_transfer download stream session=%s offset=%d retry %d/%d after %v: %v",
 			sessionID, offset, attempt, downloadPushMaxAttempts, backoff, err,
 		)
@@ -1884,7 +1884,7 @@ func (a *Agent) parkDownloadStream(sessionID string, stop <-chan struct{}, offse
 	if file != nil {
 		_ = file.Close()
 	}
-	a.Logger.Infof(
+	a.Logger.Debugf(
 		"file_transfer download stream session=%s offset=%d parked: no client ACK for %s; handle released, resumable",
 		sessionID, offset, downloadPushAckWaitMax,
 	)
@@ -1916,7 +1916,7 @@ func (a *Agent) failDownloadStream(sessionID string, stop <-chan struct{}, cause
 		}
 		if session.RemoveOnClose && session.SourcePath != "" {
 			if err := os.Remove(session.SourcePath); err != nil && !os.IsNotExist(err) {
-				a.Logger.Warnf(
+				a.Logger.Errorf(
 					"file_transfer download fail cleanup archive=%s session=%s err=%v",
 					session.SourcePath, sessionID, err,
 				)
@@ -1947,7 +1947,7 @@ func (a *Agent) reportFileTransferFailure(sessionID, message string) {
 		return
 	}
 	if resp.StatusCode() != 200 && resp.StatusCode() != 409 {
-		a.Logger.Warnf(
+		a.Logger.Errorf(
 			"file_transfer fail callback session=%s status=%d body=%s",
 			sessionID, resp.StatusCode(), string(resp.Body()),
 		)
@@ -2072,7 +2072,7 @@ func (a *Agent) pushDownloadChunk(sessionID string, offset int64) (int64, error)
 	}
 	a.DownloadTransferSessionsMu.Unlock()
 
-	a.Logger.Infof(
+	a.Logger.Debugf(
 		"file_transfer download chunk pushed session=%s offset=%d end=%d read_ms=%d put_ms=%d",
 		sessionID, offset, end, readMs, putMs,
 	)
@@ -2092,7 +2092,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	if !ok || session == nil {
 		a.DownloadTransferSessionsMu.Unlock()
 		if cancelledBuild && a.Logger != nil {
-			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 		}
 		return map[string]interface{}{"status": "completed"}, nil
 	}
@@ -2115,19 +2115,19 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		}
 		if session.RemoveOnClose && session.SourcePath != "" {
 			if err := os.Remove(session.SourcePath); err != nil && !os.IsNotExist(err) {
-				a.Logger.Warnf(
+				a.Logger.Errorf(
 					"file_transfer download release session=%s: failed to remove archive %s: %v",
 					sessionID, session.SourcePath, err,
 				)
 			}
 		}
-		a.Logger.Infof("file_transfer download released session=%s", sessionID)
+		a.Logger.Debugf("file_transfer download released session=%s", sessionID)
 		return map[string]interface{}{"status": "completed"}, nil
 	}
 	a.DownloadTransferSessionsMu.Unlock()
 
 	if err := waitResumeHashJob(hashJob); err != nil && a.Logger != nil {
-		a.Logger.Warnf(
+		a.Logger.Debugf(
 			"file_transfer download finalize session=%s: resume prefix hash: %v",
 			sessionID, err,
 		)
@@ -2138,7 +2138,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	if !ok || session == nil {
 		a.DownloadTransferSessionsMu.Unlock()
 		if cancelledBuild && a.Logger != nil {
-			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 		}
 		return map[string]interface{}{"status": "completed"}, nil
 	}
@@ -2160,7 +2160,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		if herr := hashFileRange(context.Background(), hasher, sourcePath, hashedOffset, totalSize); herr == nil {
 			computedSHA = hex.EncodeToString(hasher.Sum(nil))
 		} else if a.Logger != nil {
-			a.Logger.Warnf(
+			a.Logger.Errorf(
 				"file_transfer download finalize session=%s: failed to hash remainder: %v",
 				sessionID, herr,
 			)
@@ -2169,7 +2169,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 		if sha, herr := hashFileSHA256(sourcePath); herr == nil {
 			computedSHA = sha
 		} else {
-			a.Logger.Warnf(
+			a.Logger.Errorf(
 				"file_transfer download finalize session=%s: failed to hash source: %v",
 				sessionID, herr,
 			)
@@ -2184,7 +2184,7 @@ func (a *Agent) FinalizeFilesDownload(p *NatsMsg) (map[string]interface{}, error
 	}
 	if removeOnClose && sourcePath != "" {
 		if err := os.Remove(sourcePath); err != nil && !os.IsNotExist(err) {
-			a.Logger.Warnf(
+			a.Logger.Errorf(
 				"file_transfer download finalize session=%s: failed to remove archive %s: %v",
 				sessionID, sourcePath, err,
 			)
@@ -2425,7 +2425,7 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 
 	for _, job := range toRelease {
 		_ = job.file.Close()
-		a.Logger.Infof(
+		a.Logger.Debugf(
 			"file_transfer reaper: upload session=%s idle, handle released; "+
 				".partial kept for resume",
 			job.sessionID,
@@ -2436,13 +2436,13 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 		a.removeUploadPartialJournal(session.SessionID)
 		if session.PartialPath != "" {
 			if err := os.Remove(session.PartialPath); err != nil && !os.IsNotExist(err) {
-				a.Logger.Warnf(
+				a.Logger.Errorf(
 					"file_transfer reaper: failed to remove partial file %s for session=%s: %v",
 					session.PartialPath, session.SessionID, err,
 				)
 			}
 		}
-		a.Logger.Infof(
+		a.Logger.Debugf(
 			"file_transfer reaper: removed dormant upload session=%s "+
 				"(.partial retention elapsed)",
 			session.SessionID,
@@ -2482,13 +2482,13 @@ func (a *Agent) ReapStaleFileTransferSessions() {
 		}
 		if session.RemoveOnClose && session.SourcePath != "" {
 			if err := os.Remove(session.SourcePath); err != nil && !os.IsNotExist(err) {
-				a.Logger.Warnf(
+				a.Logger.Errorf(
 					"file_transfer reaper: failed to remove archive %s session=%s: %v",
 					session.SourcePath, session.SessionID, err,
 				)
 			}
 		}
-		a.Logger.Infof(
+		a.Logger.Debugf(
 			"file_transfer reaper: reaped idle download session=%s idle=%s",
 			session.SessionID, now.Sub(session.LastActivity).Round(time.Second),
 		)

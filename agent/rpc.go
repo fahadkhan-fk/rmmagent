@@ -951,7 +951,7 @@ func (a *Agent) RunRPC() {
 					result, err = a.ListDirectory(path, page, pageSize, nameFilter)
 				}
 				if err != nil {
-					a.Logger.Errorln("files_list:", err)
+					a.Logger.Debugln("files_list:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -968,7 +968,7 @@ func (a *Agent) RunRPC() {
 				ret := codec.NewEncoderBytes(&resp, new(codec.MsgpackHandle))
 				names, err := parsePayloadNamesJSON(p.Data)
 				if err != nil {
-					a.Logger.Errorln("files_exists:", err)
+					a.Logger.Debugln("files_exists:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -982,7 +982,7 @@ func (a *Agent) RunRPC() {
 					result, err = a.FileExists(strings.TrimSpace(p.Data["path"]), names)
 				}
 				if err != nil {
-					a.Logger.Errorln("files_exists:", err)
+					a.Logger.Debugln("files_exists:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -999,7 +999,7 @@ func (a *Agent) RunRPC() {
 
 				path := strings.TrimSpace(p.Data["path"])
 				if path == "" {
-					a.Logger.Errorln("files_properties: missing path")
+					a.Logger.Debugln("files_properties: missing path")
 					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
 					msg.Respond(resp)
 					return
@@ -1015,7 +1015,7 @@ func (a *Agent) RunRPC() {
 					result, err = a.FileProperties(path, limits)
 				}
 				if err != nil {
-					a.Logger.Errorln("files_properties:", err)
+					a.Logger.Debugln("files_properties:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -1034,13 +1034,13 @@ func (a *Agent) RunRPC() {
 				path := strings.TrimSpace(p.Data["path"])
 				name := strings.TrimSpace(p.Data["name"])
 				if path == "" {
-					a.Logger.Errorln("files_mkdir: missing path")
+					a.Logger.Debugln("files_mkdir: missing path")
 					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
 					msg.Respond(resp)
 					return
 				}
 				if name == "" {
-					a.Logger.Errorln("files_mkdir: missing name")
+					a.Logger.Debugln("files_mkdir: missing name")
 					_ = ret.Encode(map[string]interface{}{"error": "missing name"})
 					msg.Respond(resp)
 					return
@@ -1055,7 +1055,7 @@ func (a *Agent) RunRPC() {
 					result, err = a.FileMkdir(path, name)
 				}
 				if err != nil {
-					a.Logger.Errorln("files_mkdir:", err)
+					a.Logger.Debugln("files_mkdir:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -1074,13 +1074,13 @@ func (a *Agent) RunRPC() {
 				path := strings.TrimSpace(p.Data["path"])
 				newName := strings.TrimSpace(p.Data["new_name"])
 				if path == "" {
-					a.Logger.Errorln("files_rename: missing path")
+					a.Logger.Debugln("files_rename: missing path")
 					_ = ret.Encode(map[string]interface{}{"error": "missing path"})
 					msg.Respond(resp)
 					return
 				}
 				if newName == "" {
-					a.Logger.Errorln("files_rename: missing new_name")
+					a.Logger.Debugln("files_rename: missing new_name")
 					_ = ret.Encode(map[string]interface{}{"error": "missing new_name"})
 					msg.Respond(resp)
 					return
@@ -1095,7 +1095,7 @@ func (a *Agent) RunRPC() {
 					result, err = a.FileRename(path, newName)
 				}
 				if err != nil {
-					a.Logger.Errorln("files_rename:", err)
+					a.Logger.Debugln("files_rename:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -1113,7 +1113,7 @@ func (a *Agent) RunRPC() {
 
 				paths, err := parseDeletePaths(p.Data["paths"])
 				if err != nil {
-					a.Logger.Errorln("files_delete:", err)
+					a.Logger.Debugln("files_delete:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -1127,7 +1127,7 @@ func (a *Agent) RunRPC() {
 					result, err = a.FileDelete(paths)
 				}
 				if err != nil {
-					a.Logger.Errorln("files_delete:", err)
+					a.Logger.Debugln("files_delete:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 					msg.Respond(resp)
 					return
@@ -1145,7 +1145,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.PrepareFilesUpload(p)
 				if err != nil {
-					a.Logger.Errorln("files_upload_prepare:", err)
+					a.Logger.Debugln("files_upload_prepare:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)
@@ -1161,7 +1161,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.HandleUploadChunkAvailable(p)
 				if err != nil {
-					a.Logger.Errorln("files_upload_chunk_available:", err)
+					a.Logger.Debugln("files_upload_chunk_available:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)
@@ -1177,7 +1177,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.FinalizeFilesUpload(p)
 				if err != nil {
-					a.Logger.Errorln("files_upload_finalize:", err)
+					a.Logger.Debugln("files_upload_finalize:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)
@@ -1193,7 +1193,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.AbortFilesUpload(p)
 				if err != nil {
-					a.Logger.Errorln("files_upload_abort:", err)
+					a.Logger.Debugln("files_upload_abort:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)
@@ -1215,7 +1215,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.PrepareFilesDownload(p)
 				if err != nil {
-					a.Logger.Errorln("files_download_prepare:", err)
+					a.Logger.Debugln("files_download_prepare:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)
@@ -1231,7 +1231,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.FinalizeFilesDownload(p)
 				if err != nil {
-					a.Logger.Errorln("files_download_finalize:", err)
+					a.Logger.Debugln("files_download_finalize:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)
@@ -1247,7 +1247,7 @@ func (a *Agent) RunRPC() {
 
 				result, err := a.PrepareFilesDownloadArchive(p)
 				if err != nil {
-					a.Logger.Errorln("files_download_archive_prepare:", err)
+					a.Logger.Debugln("files_download_archive_prepare:", err)
 					_ = ret.Encode(map[string]interface{}{"error": err.Error()})
 				} else {
 					_ = ret.Encode(result)

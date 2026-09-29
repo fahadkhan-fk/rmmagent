@@ -634,7 +634,7 @@ func (a *Agent) buildAndServeArchive(
 
 	if err := checkArchiveCanceled(ctx); err != nil {
 		if a.Logger != nil {
-			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 		}
 		return
 	}
@@ -667,11 +667,11 @@ func (a *Agent) buildAndServeArchive(
 		_ = os.Remove(tempPath)
 		if archiveCanceledErr(err) {
 			if a.Logger != nil {
-				a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+				a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 			}
 			return
 		}
-		a.Logger.Errorln("files_download_archive build:", err)
+		a.Logger.Debugln("files_download_archive build:", err)
 		a.reportArchiveError(sessionID, err.Error())
 		return
 	}
@@ -679,7 +679,7 @@ func (a *Agent) buildAndServeArchive(
 	if err := checkArchiveCanceled(ctx); err != nil {
 		_ = os.Remove(tempPath)
 		if a.Logger != nil {
-			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 		}
 		return
 	}
@@ -696,7 +696,7 @@ func (a *Agent) buildAndServeArchive(
 		_ = os.Remove(tempPath)
 		if checkArchiveCanceled(ctx) != nil {
 			if a.Logger != nil {
-				a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+				a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 			}
 			return
 		}
@@ -707,7 +707,7 @@ func (a *Agent) buildAndServeArchive(
 	if err := checkArchiveCanceled(ctx); err != nil {
 		_ = os.Remove(tempPath)
 		if a.Logger != nil {
-			a.Logger.Infof("file_transfer archive cancelled session=%s", sessionID)
+			a.Logger.Debugf("file_transfer archive cancelled session=%s", sessionID)
 		}
 		return
 	}
@@ -769,7 +769,7 @@ func (a *Agent) reportArchiveReady(
 			return true
 		}
 		if err == nil && resp.StatusCode() >= 400 && resp.StatusCode() < 500 {
-			a.Logger.Warnf(
+			a.Logger.Debugf(
 				"file_transfer archive-ready callback session=%s status=%d body=%s (not retrying)",
 				sessionID, resp.StatusCode(), string(resp.Body()),
 			)
@@ -782,7 +782,7 @@ func (a *Agent) reportArchiveReady(
 					sessionID, attempt, err,
 				)
 			} else {
-				a.Logger.Warnf(
+				a.Logger.Errorf(
 					"file_transfer archive-ready callback session=%s failed after %d attempts status=%d",
 					sessionID, attempt, resp.StatusCode(),
 				)
@@ -841,7 +841,7 @@ func (a *Agent) SweepOrphanedArchives() {
 		removed += sweepArchiveTempDir(osTmp)
 	}
 	if removed > 0 && a.Logger != nil {
-		a.Logger.Infof("file_transfer startup: removed %d orphaned archive temp file(s)", removed)
+		a.Logger.Debugf("file_transfer startup: removed %d orphaned archive temp file(s)", removed)
 	}
 	a.sweepOrphanedUploadPartials(time.Now())
 }
